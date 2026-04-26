@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -76,32 +77,37 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
 
-// ── Obsidian Color Tokens ──
-private val Void = Color(0xFF000000)
-private val Base = Color(0xFF0A0A0A)
-private val Surface1 = Color(0xFF111111)
-private val Surface2 = Color(0xFF171717)
-private val Surface3 = Color(0xFF1E1E1E)
-private val BorderClr = Color(0xFF262626)
-private val TextPrim = Color(0xFFF5F5F5)
-private val TextSec = Color(0xFFA3A3A3)
-private val TextMut = Color(0xFF636363)
-private val StatusGreen = Color(0xFF34D399)
+// ── Liquid Glass Color Tokens ──
+private val Void = Color(0xFF030305)
+private val SurfaceGlass = Color(0x1AFFFFFF) // 10% white for glass
+private val SurfaceGlassDark = Color(0x0DFFFFFF) // 5% white for darker glass
+private val BorderGlass = Color(0x26FFFFFF) // 15% white for border
+private val TextPrim = Color(0xFFFFFFFF)
+private val TextSec = Color(0xB3FFFFFF) // 70% white
+private val TextMut = Color(0x80FFFFFF) // 50% white
+private val AccentBrand = Color(0xFF60A5FA) // Blueish accent
+private val ButtonGlass = Color(0x1AFFFFFF)
+private val ButtonGlassHover = Color(0x33FFFFFF)
 
 private val ObsidianScheme = darkColorScheme(
     background = Void,
-    surface = Surface1,
-    surfaceVariant = Surface2,
+    surface = SurfaceGlass,
+    surfaceVariant = SurfaceGlassDark,
     onBackground = TextPrim,
     onSurface = TextPrim,
     onSurfaceVariant = TextSec,
-    primary = Color.White,
-    onPrimary = Color.Black,
-    outline = BorderClr
+    primary = AccentBrand,
+    onPrimary = Void,
+    outline = BorderGlass
 )
 
 class MainActivity : ComponentActivity() {
@@ -115,9 +121,34 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 20)
         }
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             MaterialTheme(colorScheme = ObsidianScheme) {
-                Surface(Modifier.fillMaxSize(), color = Void) {
+                Box(Modifier.fillMaxSize().background(Void)) {
+                    // Mesh Gradient Background
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .background(
+                                Brush.radialGradient(
+                                    colors = listOf(Color(0xFF1E112A), Color(0xFF0D1424), Void),
+                                    radius = 2000f,
+                                    center = androidx.compose.ui.geometry.Offset(0f, 0f)
+                                )
+                            )
+                    )
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .background(
+                                Brush.radialGradient(
+                                    colors = listOf(Color(0xFF0F1E2A), Color(0xFF050F1A), Color.Transparent),
+                                    radius = 1800f,
+                                    center = androidx.compose.ui.geometry.Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+                                )
+                            )
+                    )
+
                     CcpScreen(
                         node = node,
                         openNotificationAccess = ::openNotificationAccess,
@@ -154,9 +185,9 @@ class MainActivity : ComponentActivity() {
 fun ObsidianCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     Card(
         modifier = modifier,
-        colors = CardDefaults.cardColors(containerColor = Surface1),
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, BorderClr)
+        colors = CardDefaults.cardColors(containerColor = SurfaceGlassDark),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, BorderGlass)
     ) {
         content()
     }
@@ -192,9 +223,10 @@ fun CcpScreen(
     Column(
         Modifier
             .fillMaxSize()
+            .systemBarsPadding()
             .verticalScroll(rememberScrollState())
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         AnimatedVisibility(visible, enter = fadeIn(tween(350)) + slideInVertically(spring(Spring.DampingRatioLowBouncy)) { -20 }) {
             HeroCard(snapshot)
@@ -244,11 +276,11 @@ fun CcpScreen(
 @Composable
 fun HeroCard(snapshot: LocalDeviceSnapshot) {
     ObsidianCard {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("CCP", color = TextPrim, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                Box(Modifier.background(Surface3, RoundedCornerShape(50)).padding(horizontal = 8.dp, vertical = 2.dp)) {
-                    Text("v0.2", color = TextMut, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("CCP", color = TextPrim, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                Box(Modifier.background(SurfaceGlass, RoundedCornerShape(50)).border(1.dp, BorderGlass, RoundedCornerShape(50)).padding(horizontal = 10.dp, vertical = 3.dp)) {
+                    Text("v0.2", color = TextSec, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                 }
             }
             Text("Cross-device control surface", color = TextSec, fontSize = 13.sp)
@@ -285,7 +317,7 @@ fun StatCell(label: String, value: String, modifier: Modifier = Modifier) {
 
 @Composable
 fun VertDiv() {
-    Box(Modifier.width(1.dp).height(44.dp).background(BorderClr).padding(vertical = 8.dp))
+    Box(Modifier.width(1.dp).height(48.dp).background(BorderGlass).padding(vertical = 10.dp))
 }
 
 @Composable
@@ -297,21 +329,21 @@ fun PermissionsCard(
 ) {
     ObsidianCard {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Permissions", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
-            Text("Enable gallery and notification access for full functionality.", color = TextMut, fontSize = 12.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = requestMediaAccess, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec)) {
-                    Icon(Icons.Rounded.Collections, null, Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Gallery", fontSize = 12.sp)
+            Text("Permissions", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+            Text("Enable gallery and notification access for full functionality.", color = TextMut, fontSize = 13.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(onClick = requestMediaAccess, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim)) {
+                    Icon(Icons.Rounded.Collections, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Gallery", fontSize = 13.sp)
                 }
-                OutlinedButton(onClick = openNotificationAccess, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec)) {
-                    Icon(Icons.Rounded.Notifications, null, Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Notifications", fontSize = 12.sp)
+                OutlinedButton(onClick = openNotificationAccess, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim)) {
+                    Icon(Icons.Rounded.Notifications, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Notifications", fontSize = 13.sp)
                 }
-                OutlinedButton(onClick = openAppNotificationSettings, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec)) {
-                    Icon(Icons.Rounded.Settings, null, Modifier.size(16.dp))
+                OutlinedButton(onClick = openAppNotificationSettings, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim)) {
+                    Icon(Icons.Rounded.Settings, null, Modifier.size(18.dp))
                 }
             }
             Text("Gallery ${snapshot.galleryAccess.lowercase()} · Notifications ${snapshot.notificationAccess.lowercase()}", color = TextMut, fontSize = 11.sp)
@@ -322,8 +354,8 @@ fun PermissionsCard(
 @Composable
 fun NearbyDevicesCard(peers: List<DeviceInfo>, onPair: (DeviceInfo) -> Unit, onInspect: (DeviceInfo) -> Unit, onSend: (DeviceInfo) -> Unit) {
     ObsidianCard {
-        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Nearby devices", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Nearby devices", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
             if (peers.isEmpty()) {
                 Text("Scanning on local Wi-Fi…", color = TextMut, fontSize = 13.sp)
             } else {
@@ -348,7 +380,7 @@ fun RemotePanelCard(panel: RemotePeerPanel?) {
             Text(panel.subtitle, color = TextMut, fontSize = 12.sp)
 
             // Stats row
-            Card(colors = CardDefaults.cardColors(containerColor = Surface2), shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, BorderClr)) {
+            Card(colors = CardDefaults.cardColors(containerColor = SurfaceGlassDark), shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, BorderGlass)) {
                 Row(Modifier.fillMaxWidth()) {
                     StatCell("Battery", panel.battery, Modifier.weight(1f))
                     VertDiv()
@@ -395,12 +427,13 @@ fun RecentTransfersCard(recentReceived: JSONArray) {
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .border(1.dp, BorderClr, RoundedCornerShape(10.dp))
-                            .padding(10.dp),
+                            .background(SurfaceGlassDark, RoundedCornerShape(12.dp))
+                            .border(1.dp, BorderGlass, RoundedCornerShape(12.dp))
+                            .padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Box(Modifier.size(32.dp).background(Surface3, CircleShape), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(36.dp).background(SurfaceGlass, CircleShape).border(1.dp, BorderGlass, CircleShape), contentAlignment = Alignment.Center) {
                             Icon(
                                 if (item.optString("type") == "gallery") Icons.Rounded.Collections else Icons.Rounded.Storage,
                                 contentDescription = null, tint = TextSec, modifier = Modifier.size(16.dp)
@@ -434,30 +467,34 @@ fun DeviceRow(peer: DeviceInfo, onPair: () -> Unit, onInspect: () -> Unit, onSen
     Row(
         Modifier
             .fillMaxWidth()
-            .border(1.dp, BorderClr, RoundedCornerShape(10.dp))
-            .padding(10.dp),
+            .background(SurfaceGlassDark, RoundedCornerShape(12.dp))
+            .border(1.dp, BorderGlass, RoundedCornerShape(12.dp))
+            .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Box(
-            modifier = Modifier.size(34.dp).background(if (peer.trusted) Surface3 else Surface2, RoundedCornerShape(10.dp)),
+            modifier = Modifier.size(40.dp).background(if (peer.trusted) AccentBrand.copy(alpha = 0.2f) else SurfaceGlass, RoundedCornerShape(12.dp)).border(1.dp, if (peer.trusted) AccentBrand.copy(alpha=0.5f) else BorderGlass, RoundedCornerShape(12.dp)),
             contentAlignment = Alignment.Center
         ) {
-            Text(peer.platform.take(1).uppercase(), color = if (peer.trusted) TextPrim else TextMut, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Text(peer.platform.take(1).uppercase(), color = if (peer.trusted) AccentBrand else TextSec, fontWeight = FontWeight.Bold, fontSize = 16.sp)
         }
         Column(Modifier.weight(1f)) {
-            Text(peer.deviceName, fontWeight = FontWeight.SemiBold, color = TextPrim, fontSize = 13.sp)
-            Text("${peer.platform}  ${peer.primaryRouteLabel}", fontSize = 10.sp, color = TextMut)
-            Text(peer.transportSummary, fontSize = 10.sp, color = TextSec, modifier = Modifier.padding(top = 2.dp))
+            Text(peer.deviceName, fontWeight = FontWeight.SemiBold, color = TextPrim, fontSize = 14.sp)
+            Text("${peer.platform}  ${peer.primaryRouteLabel}", fontSize = 11.sp, color = TextMut)
+            Text(peer.transportSummary, fontSize = 11.sp, color = TextSec, modifier = Modifier.padding(top = 2.dp))
         }
-        OutlinedButton(onClick = onPair, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec), modifier = Modifier.height(32.dp)) {
-            Text("Pair", fontSize = 11.sp)
-        }
-        OutlinedButton(onClick = onInspect, enabled = peer.trusted, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec), modifier = Modifier.height(32.dp)) {
-            Icon(Icons.Rounded.Visibility, null, Modifier.size(15.dp))
-        }
-        Button(onClick = onSend, enabled = peer.trusted, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black, disabledContainerColor = Surface2, disabledContentColor = TextMut), modifier = Modifier.height(32.dp)) {
-            Text("Send", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+        if (!peer.trusted) {
+            OutlinedButton(onClick = onPair, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim), modifier = Modifier.height(36.dp)) {
+                Text("Pair", fontSize = 12.sp)
+            }
+        } else {
+            OutlinedButton(onClick = onInspect, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim), modifier = Modifier.height(36.dp)) {
+                Icon(Icons.Rounded.Visibility, null, Modifier.size(16.dp))
+            }
+            Button(onClick = onSend, colors = ButtonDefaults.buttonColors(containerColor = AccentBrand, contentColor = Void), modifier = Modifier.height(36.dp)) {
+                Text("Send", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
         }
     }
 }

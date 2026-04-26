@@ -6,18 +6,18 @@
         <ResourceDictionary>
             <!-- ── OBSIDIAN DESIGN SYSTEM ── -->
 
-            <!-- Backgrounds: true black spectrum -->
-            <SolidColorBrush x:Key="VoidBrush" Color="#000000" />
-            <SolidColorBrush x:Key="BaseBrush" Color="#0A0A0A" />
-            <SolidColorBrush x:Key="Surface1" Color="#111111" />
-            <SolidColorBrush x:Key="Surface2" Color="#171717" />
-            <SolidColorBrush x:Key="Surface3" Color="#1E1E1E" />
-            <SolidColorBrush x:Key="SurfaceHover" Color="#242424" />
+            <!-- Backgrounds: true black spectrum with alpha for glass -->
+            <SolidColorBrush x:Key="VoidBrush" Color="#030305" />
+            <SolidColorBrush x:Key="BaseBrush" Color="#08080C" />
+            <SolidColorBrush x:Key="Surface1" Color="#20FFFFFF" /> <!-- Glass Layer 1 -->
+            <SolidColorBrush x:Key="Surface2" Color="#15FFFFFF" /> <!-- Glass Layer 2 -->
+            <SolidColorBrush x:Key="Surface3" Color="#2AFFFFFF" /> <!-- Glass Highlight -->
+            <SolidColorBrush x:Key="SurfaceHover" Color="#35FFFFFF" />
 
             <!-- Borders -->
-            <SolidColorBrush x:Key="BorderSubtle" Color="White" Opacity="0.07" />
-            <SolidColorBrush x:Key="BorderMed" Color="White" Opacity="0.12" />
-            <SolidColorBrush x:Key="BorderBright" Color="White" Opacity="0.18" />
+            <SolidColorBrush x:Key="BorderSubtle" Color="#20FFFFFF" />
+            <SolidColorBrush x:Key="BorderMed" Color="#30FFFFFF" />
+            <SolidColorBrush x:Key="BorderBright" Color="#45FFFFFF" />
 
             <!-- Text -->
             <SolidColorBrush x:Key="TextPrimary" Color="#F5F5F5" />
@@ -87,23 +87,23 @@
             <Style x:Key="AccentBtn" TargetType="Button">
                 <Setter Property="FontFamily" Value="{StaticResource Body}" />
                 <Setter Property="FontSize" Value="12" />
-                <Setter Property="FontWeight" Value="SemiBold" />
-                <Setter Property="Foreground" Value="#0A0A0A" />
+                <Setter Property="FontWeight" Value="Bold" />
+                <Setter Property="Foreground" Value="#FFFFFF" />
                 <Setter Property="Cursor" Value="Hand" />
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="Button">
-                            <Border x:Name="Bd" Background="White" CornerRadius="{StaticResource R8}" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
+                            <Border x:Name="Bd" Background="#3B82F6" BorderBrush="#60A5FA" BorderThickness="1" CornerRadius="{StaticResource R8}" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
                                 <Border.RenderTransform><ScaleTransform x:Name="S" ScaleX="1" ScaleY="1"/></Border.RenderTransform>
                                 <Border.RenderTransformOrigin><Point X="0.5" Y="0.5"/></Border.RenderTransformOrigin>
                                 <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="Bd" Property="Background" Value="#E8E8E8"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="#60A5FA"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter TargetName="Bd" Property="Background" Value="#D4D4D4"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="#2563EB"/>
                                     <Trigger.EnterActions><BeginStoryboard><Storyboard>
                                         <DoubleAnimation Storyboard.TargetName="S" Storyboard.TargetProperty="ScaleX" To="0.96" Duration="0:0:0.06"/>
                                         <DoubleAnimation Storyboard.TargetName="S" Storyboard.TargetProperty="ScaleY" To="0.96" Duration="0:0:0.06"/>
