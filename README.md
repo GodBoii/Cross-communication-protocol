@@ -20,7 +20,8 @@ The first implementation targets Windows and Android:
 
 - LAN discovery over UDP broadcast.
 - Device identity and trust-on-first-use pairing.
-- TCP control channel with newline-delimited JSON.
+- Multi-route discovery metadata for Wi-Fi, LAN, USB networking, Bluetooth-backed IP paths, and internet-capable environments.
+- TCP control channel with newline-delimited JSON and route fallback across advertised endpoints.
 - Chunked file transfer with SHA-256 verification.
 - GUI shells for Windows and Android.
 

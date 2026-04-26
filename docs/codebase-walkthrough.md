@@ -30,6 +30,8 @@ The protocol is defined in [ccp-v0.md](C:/Users/prajw/Downloads/CCP/shared/proto
 
 The protocol is LAN-first. Right now there is no BLE, mDNS, relay server, TURN, WebRTC, or TLS. That is a conscious first-stage tradeoff so the native apps can connect quickly and predictably on the same network.
 
+The current implementation now advertises multiple route candidates and transport status metadata inside discovery packets. That means the apps can distinguish Wi-Fi, wired LAN, USB networking, Bluetooth-backed IP links, and internet-capable/cloud-routable environments when deciding how to connect, even though the actual transfer socket is still TCP in v0.
+
 ## 3. Windows Native App
 
 The native Windows code lives in [windows/native-csharp](C:/Users/prajw/Downloads/CCP/windows/native-csharp).
@@ -110,10 +112,12 @@ Its responsibilities are:
 Important implementation details:
 
 - Discovery is stateless UDP broadcast.
+- Discovery now includes transport metadata and route candidates, not just one TCP endpoint.
 - Pairing uses a short code plus user confirmation on Windows.
 - File chunks are base64 inside JSON for now.
 - Full-file integrity is checked with SHA-256 at completion.
 - Incoming filenames are sanitized and uniqued so files do not overwrite each other.
+- Outbound connections now try multiple advertised routes in priority order for better resilience across Wi-Fi, LAN, USB networking, Bluetooth PAN, and similar IP-backed paths.
 - The backend now has a helper to normalize string values from JSON payloads, which matters because `System.Text.Json` deserializes payload values as `JsonElement`.
 
 That last point is one of the subtle C# issues that was easy to miss. Without handling `JsonElement` properly, string payload fields such as `sha256`, `pair_code`, or `filename` become fragile.
@@ -200,6 +204,9 @@ Recent fixes here matter:
 - duplicate received filenames are uniqued
 - the unnecessary non-null assertions were removed
 - the deprecated send icon was replaced with the auto-mirrored version
+- outbound file sends now stream directly from the selected `Uri` instead of loading the entire file into memory first
+- discovery now advertises transport status and multiple connection routes
+- peer cards can expose connection options more clearly and the inspect action is now usable in the UI
 
 That makes the Android side less brittle during service restarts and repeated app launches.
 
