@@ -1,7 +1,12 @@
 package com.ccp.android
 
 import android.content.Context
+import android.database.Cursor
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
 import android.net.wifi.WifiManager
+import android.provider.OpenableColumns
 import android.util.Base64
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -10,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -19,8 +25,11 @@ import java.io.OutputStreamWriter
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.util.Locale
 import kotlin.random.Random
 
 class CcpNode(private val context: Context) {
@@ -46,7 +55,7 @@ class CcpNode(private val context: Context) {
     val snapshot: StateFlow<LocalDeviceSnapshot> = _snapshot
 
     private val _recentReceived = MutableStateFlow(deviceData.recentReceived())
-    val recentReceived: StateFlow<org.json.JSONArray> = _recentReceived
+    val recentReceived: StateFlow<JSONArray> = _recentReceived
 
     private val _remotePanel = MutableStateFlow<RemotePeerPanel?>(null)
     val remotePanel: StateFlow<RemotePeerPanel?> = _remotePanel
@@ -96,43 +105,58 @@ class CcpNode(private val context: Context) {
         }
     }
 
-    fun sendFile(peer: DeviceInfo, fileName: String, bytes: ByteArray) {
+    fun sendFile(peer: DeviceInfo, uri: Uri) {
         scope.launch {
             if (!peer.trusted) {
                 log("Pair with ${peer.deviceName} before sending files.")
                 return@launch
             }
+
+            val fileName = resolveDisplayName(uri)
+            val (size, fullHash) = context.contentResolver.openInputStream(uri).use { input ->
+                requireNotNull(input) { "Could not open selected file" }
+                sha256Hex(input)
+            }
+            val totalChunks = ((size + CCP_CHUNK_SIZE - 1) / CCP_CHUNK_SIZE).toInt()
             val transferId = java.util.UUID.randomUUID().toString()
-            val fullHash = sha256Hex(bytes)
-            val totalChunks = (bytes.size + CCP_CHUNK_SIZE - 1) / CCP_CHUNK_SIZE
-            Socket(peer.host, peer.tcpPort).use { socket ->
+
+            connectPeer(peer).use { socket ->
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                 val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
                 write(writer, ccpEnvelope("file.offer", store.sender(), JSONObject()
                     .put("transfer_id", transferId)
                     .put("filename", fileName)
-                    .put("size", bytes.size)
+                    .put("size", size)
                     .put("sha256", fullHash)
                     .put("chunk_size", CCP_CHUNK_SIZE)
                     .put("total_chunks", totalChunks)))
+
                 val offerResponse = JSONObject(reader.readLine())
                 if (!offerResponse.getJSONObject("payload").optBoolean("accepted")) {
                     log("${peer.deviceName} rejected $fileName")
                     return@use
                 }
-                var sent = 0
-                for (index in 0 until totalChunks) {
-                    val from = index * CCP_CHUNK_SIZE
-                    val to = minOf(from + CCP_CHUNK_SIZE, bytes.size)
-                    val chunk = bytes.copyOfRange(from, to)
-                    write(writer, ccpEnvelope("file.chunk", store.sender(), JSONObject()
-                        .put("transfer_id", transferId)
-                        .put("index", index)
-                        .put("sha256", sha256Hex(chunk))
-                        .put("data_b64", Base64.encodeToString(chunk, Base64.NO_WRAP))))
-                    sent += chunk.size
-                    log("Sending $fileName: $sent / ${bytes.size} bytes")
+
+                val buffer = ByteArray(CCP_CHUNK_SIZE)
+                var sent = 0L
+                var index = 0
+                context.contentResolver.openInputStream(uri).use { input ->
+                    requireNotNull(input) { "Could not reopen selected file" }
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        val chunk = if (read == buffer.size) buffer.copyOf() else buffer.copyOfRange(0, read)
+                        write(writer, ccpEnvelope("file.chunk", store.sender(), JSONObject()
+                            .put("transfer_id", transferId)
+                            .put("index", index)
+                            .put("sha256", sha256Hex(chunk))
+                            .put("data_b64", Base64.encodeToString(chunk, Base64.NO_WRAP))))
+                        sent += read
+                        index += 1
+                        log("Sending $fileName: $sent / $size bytes")
+                    }
                 }
+
                 write(writer, ccpEnvelope("file.complete", store.sender(), JSONObject()
                     .put("transfer_id", transferId)
                     .put("sha256", fullHash)))
@@ -172,8 +196,13 @@ class CcpNode(private val context: Context) {
         DatagramSocket().use { socket ->
             socket.broadcast = true
             while (running) {
-                val data = ccpDiscovery(store.sender()).toString().toByteArray()
+                val data = ccpDiscovery(
+                    store.sender(),
+                    buildTransportPayload(),
+                    buildEndpointPayload()
+                ).toString().toByteArray()
                 socket.send(DatagramPacket(data, data.size, InetAddress.getByName("255.255.255.255"), CCP_UDP_PORT))
+                pruneStalePeers()
                 delay(3000)
             }
         }
@@ -189,15 +218,19 @@ class CcpNode(private val context: Context) {
                     socket.receive(packet)
                     val json = JSONObject(String(packet.data, 0, packet.length))
                     if (json.optString("protocol") != CCP_PROTOCOL || json.optString("device_id") == store.deviceId) continue
-                    updatePeer(DeviceInfo(
-                        deviceId = json.getString("device_id"),
-                        deviceName = json.optString("device_name", "Unknown"),
-                        platform = json.optString("platform", "unknown"),
-                        host = packet.address.hostAddress ?: "",
-                        tcpPort = json.optInt("tcp_port", CCP_TCP_PORT),
-                        trusted = store.isTrusted(json.getString("device_id"))
-                    ))
-                } catch (_: java.net.SocketTimeoutException) {
+                    updatePeer(
+                        DeviceInfo(
+                            deviceId = json.getString("device_id"),
+                            deviceName = json.optString("device_name", "Unknown"),
+                            platform = json.optString("platform", "unknown"),
+                            host = packet.address.hostAddress ?: "",
+                            tcpPort = json.optInt("tcp_port", CCP_TCP_PORT),
+                            trusted = store.isTrusted(json.getString("device_id")),
+                            transports = parseTransports(json.optJSONObject("transports")),
+                            routes = parseRoutes(json.optJSONArray("endpoints"), packet.address.hostAddress ?: "", json.optInt("tcp_port", CCP_TCP_PORT))
+                        )
+                    )
+                } catch (_: SocketTimeoutException) {
                 }
             }
         }
@@ -211,7 +244,7 @@ class CcpNode(private val context: Context) {
                 try {
                     val socket = server.accept()
                     scope.launch { handleClient(socket) }
-                } catch (_: java.net.SocketTimeoutException) {
+                } catch (_: SocketTimeoutException) {
                 }
             }
         }
@@ -219,6 +252,7 @@ class CcpNode(private val context: Context) {
 
     private fun handleClient(socket: Socket) {
         socket.use {
+            it.tcpNoDelay = true
             val reader = BufferedReader(InputStreamReader(it.getInputStream()))
             val writer = BufferedWriter(OutputStreamWriter(it.getOutputStream()))
             var activeFile: File? = null
@@ -297,12 +331,41 @@ class CcpNode(private val context: Context) {
     }
 
     private fun sendSingle(peer: DeviceInfo, message: JSONObject): JSONObject? {
-        return Socket(peer.host, peer.tcpPort).use { socket ->
+        return connectPeer(peer).use { socket ->
             val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
             write(writer, message)
             JSONObject(reader.readLine())
         }
+    }
+
+    private fun connectPeer(peer: DeviceInfo): Socket {
+        val rankedRoutes = rankRoutes(peer)
+        var lastError: Exception? = null
+        for (route in rankedRoutes) {
+            try {
+                val socket = Socket()
+                socket.tcpNoDelay = true
+                socket.connect(java.net.InetSocketAddress(route.host, route.tcpPort), 2500)
+                log("Connected to ${peer.deviceName} via ${route.transport}")
+                return socket
+            } catch (ex: Exception) {
+                lastError = ex
+            }
+        }
+        throw IllegalStateException("Could not connect to ${peer.deviceName}: ${lastError?.message}", lastError)
+    }
+
+    private fun rankRoutes(peer: DeviceInfo): List<ConnectionRoute> {
+        val routes = if (peer.routes.isEmpty()) {
+            listOf(ConnectionRoute("direct", peer.host, peer.tcpPort))
+        } else {
+            peer.routes
+        }
+        val priority = mapOf("usb" to 0, "wifi" to 1, "lan" to 2, "bluetooth" to 3, "cloud" to 4, "direct" to 5)
+        return routes
+            .distinctBy { "${it.transport}|${it.host}|${it.tcpPort}" }
+            .sortedBy { priority[it.transport] ?: 99 }
     }
 
     private fun write(writer: BufferedWriter, message: JSONObject) {
@@ -312,8 +375,24 @@ class CcpNode(private val context: Context) {
     }
 
     private fun updatePeer(peer: DeviceInfo) {
-        peersById[peer.deviceId] = peer
+        peersById[peer.deviceId] = peer.copy(lastSeen = System.currentTimeMillis())
         _peers.value = peersById.values.sortedByDescending { it.lastSeen }
+    }
+
+    private fun pruneStalePeers() {
+        val cutoff = System.currentTimeMillis() - 20_000
+        val iterator = peersById.iterator()
+        var changed = false
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.value.lastSeen < cutoff) {
+                iterator.remove()
+                changed = true
+            }
+        }
+        if (changed) {
+            _peers.value = peersById.values.sortedByDescending { it.lastSeen }
+        }
     }
 
     private fun safeFilename(name: String): String {
@@ -350,7 +429,7 @@ class CcpNode(private val context: Context) {
         _recentReceived.value = deviceData.recentReceived()
     }
 
-    private fun parseFacts(array: org.json.JSONArray?): List<RemoteFactItem> {
+    private fun parseFacts(array: JSONArray?): List<RemoteFactItem> {
         if (array == null) return emptyList()
         val list = ArrayList<RemoteFactItem>(array.length())
         for (index in 0 until array.length()) {
@@ -360,7 +439,7 @@ class CcpNode(private val context: Context) {
         return list
     }
 
-    private fun parseEntries(array: org.json.JSONArray?, fallback: String): List<RemoteEntryItem> {
+    private fun parseEntries(array: JSONArray?, fallback: String): List<RemoteEntryItem> {
         if (array == null) return emptyList()
         val list = ArrayList<RemoteEntryItem>(array.length())
         for (index in 0 until array.length()) {
@@ -379,4 +458,138 @@ class CcpNode(private val context: Context) {
         }
         return list
     }
+
+    private fun buildTransportPayload(): JSONObject {
+        val statuses = detectTransportStatus()
+        return JSONObject().apply {
+            statuses.forEach { (name, status) ->
+                put(name, JSONObject()
+                    .put("available", status.available)
+                    .put("connected", status.connected)
+                    .put("detail", status.detail))
+            }
+        }
+    }
+
+    private fun buildEndpointPayload(): JSONArray {
+        return JSONArray().apply {
+            detectAdvertisedRoutes().forEach { route ->
+                put(JSONObject()
+                    .put("transport", route.transport)
+                    .put("host", route.host)
+                    .put("port", route.tcpPort))
+            }
+        }
+    }
+
+    private fun parseTransports(transports: JSONObject?): List<String> {
+        if (transports == null) return emptyList()
+        val names = ArrayList<String>()
+        transports.keys().forEach { key ->
+            val item = transports.optJSONObject(key) ?: return@forEach
+            if (item.optBoolean("available")) names.add(key)
+        }
+        return names
+    }
+
+    private fun parseRoutes(endpoints: JSONArray?, fallbackHost: String, fallbackPort: Int): List<ConnectionRoute> {
+        if (endpoints == null || endpoints.length() == 0) {
+            return listOf(ConnectionRoute("direct", fallbackHost, fallbackPort))
+        }
+
+        val routes = ArrayList<ConnectionRoute>(endpoints.length())
+        for (index in 0 until endpoints.length()) {
+            val item = endpoints.optJSONObject(index) ?: continue
+            val host = item.optString("host")
+            val transport = item.optString("transport", "direct")
+            val port = item.optInt("port", fallbackPort)
+            if (host.isNotBlank()) {
+                routes.add(ConnectionRoute(transport, host, port))
+            }
+        }
+        if (routes.isEmpty()) {
+            routes.add(ConnectionRoute("direct", fallbackHost, fallbackPort))
+        }
+        return routes
+    }
+
+    private data class TransportStatus(val available: Boolean, val connected: Boolean, val detail: String)
+
+    private fun detectTransportStatus(): Map<String, TransportStatus> {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val active = manager.activeNetwork
+        val capabilities = manager.getNetworkCapabilities(active)
+        val adapters = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty().filter { it.isUp }
+
+        val wifi = adapters.filter { it.name.contains("wlan", true) || it.name.contains("wifi", true) }
+        val lan = adapters.filter { it.name.contains("eth", true) }
+        val usb = adapters.filter { it.name.contains("usb", true) || it.name.contains("rndis", true) }
+        val bluetooth = adapters.filter { it.name.contains("bt", true) || it.displayName?.contains("bluetooth", true) == true }
+        val cloud = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+
+        return mapOf(
+            "wifi" to TransportStatus(
+                available = wifi.isNotEmpty() || capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true,
+                connected = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true,
+                detail = wifi.firstOrNull()?.displayName ?: "Unavailable"
+            ),
+            "lan" to TransportStatus(
+                available = lan.isNotEmpty() || capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true,
+                connected = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true,
+                detail = lan.firstOrNull()?.displayName ?: "Unavailable"
+            ),
+            "usb" to TransportStatus(
+                available = usb.isNotEmpty() || capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_USB) == true,
+                connected = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_USB) == true,
+                detail = usb.firstOrNull()?.displayName ?: "Unavailable"
+            ),
+            "bluetooth" to TransportStatus(
+                available = bluetooth.isNotEmpty() || capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) == true,
+                connected = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) == true,
+                detail = bluetooth.firstOrNull()?.displayName ?: "Unavailable"
+            ),
+            "cloud" to TransportStatus(
+                available = cloud,
+                connected = cloud,
+                detail = if (cloud) "Internet-capable network present" else "Unavailable"
+            )
+        )
+    }
+
+    private fun detectAdvertisedRoutes(): List<ConnectionRoute> {
+        val routes = ArrayList<ConnectionRoute>()
+        val interfaces = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+        interfaces.filter { it.isUp }.forEach { network ->
+            val transport = classifyTransport(network)
+            network.inetAddresses.toList()
+                .filter { address -> !address.isLoopbackAddress && address.hostAddress?.contains(':') == false }
+                .forEach { address ->
+                    val host = address.hostAddress
+                    if (!host.isNullOrBlank()) {
+                        routes.add(ConnectionRoute(transport, host, CCP_TCP_PORT))
+                    }
+                }
+        }
+        return routes.distinctBy { "${it.transport}|${it.host}|${it.tcpPort}" }
+    }
+
+    private fun classifyTransport(network: NetworkInterface): String {
+        val name = "${network.name} ${network.displayName.orEmpty()}".lowercase(Locale.getDefault())
+        return when {
+            "usb" in name || "rndis" in name -> "usb"
+            "wlan" in name || "wifi" in name -> "wifi"
+            "eth" in name -> "lan"
+            "bluetooth" in name || "bt" in name -> "bluetooth"
+            else -> "cloud"
+        }
+    }
+
+    private fun resolveDisplayName(uri: Uri): String {
+        return context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+        } ?: "android-file-${System.currentTimeMillis()}"
+    }
 }
+
+private fun Cursor.string(column: String): String = getString(getColumnIndexOrThrow(column))
