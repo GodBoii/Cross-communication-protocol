@@ -264,14 +264,24 @@
                         </TabItem>
 
                         <TabItem Header="Gallery" Style="{StaticResource TabBtn}">
-                            <ListBox ItemsSource="{Binding GalleryItems}">
+                            <ListBox ItemsSource="{Binding GalleryItems}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate DataType="{x:Type models:RemoteContentItem}">
-                                        <Border BorderBrush="{StaticResource BorderSubtle}" BorderThickness="0,0,0,1" Padding="4,8">
-                                            <StackPanel>
-                                                <TextBlock Text="{Binding Name}" FontWeight="Medium" Foreground="{StaticResource TextPrimary}" FontSize="12"/>
-                                                <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,2,0,0"/>
-                                            </StackPanel>
+                                        <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Margin="0,0,0,8" Padding="10">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Border Width="40" Height="40" CornerRadius="{StaticResource R6}" Background="#15FFFFFF" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" VerticalAlignment="Center">
+                                                    <!-- Simple photo placeholder icon -->
+                                                    <TextBlock Text="IMG" FontSize="11" FontWeight="Bold" Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding Name}" FontWeight="Medium" Foreground="{StaticResource TextPrimary}" FontSize="13" TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
+                                                </StackPanel>
+                                            </Grid>
                                         </Border>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
@@ -279,14 +289,23 @@
                         </TabItem>
 
                         <TabItem Header="Files" Style="{StaticResource TabBtn}">
-                            <ListBox ItemsSource="{Binding FileItems}">
+                            <ListBox ItemsSource="{Binding FileItems}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate DataType="{x:Type models:RemoteContentItem}">
-                                        <Border BorderBrush="{StaticResource BorderSubtle}" BorderThickness="0,0,0,1" Padding="4,8">
-                                            <StackPanel>
-                                                <TextBlock Text="{Binding Name}" FontWeight="Medium" Foreground="{StaticResource TextPrimary}" FontSize="12"/>
-                                                <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,2,0,0"/>
-                                            </StackPanel>
+                                        <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Margin="0,0,0,8" Padding="10">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Border Width="40" Height="40" CornerRadius="{StaticResource R6}" Background="#15FFFFFF" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" VerticalAlignment="Center">
+                                                    <TextBlock Text="FILE" FontSize="11" FontWeight="Bold" Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding Name}" FontWeight="Medium" Foreground="{StaticResource TextPrimary}" FontSize="13" TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
+                                                </StackPanel>
+                                            </Grid>
                                         </Border>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
@@ -294,14 +313,21 @@
                         </TabItem>
 
                         <TabItem Header="Notifications" Style="{StaticResource TabBtn}">
-                            <ListBox ItemsSource="{Binding NotificationItems}">
+                            <ListBox ItemsSource="{Binding NotificationItems}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate DataType="{x:Type models:RemoteContentItem}">
-                                        <Border BorderBrush="{StaticResource BorderSubtle}" BorderThickness="0,0,0,1" Padding="4,8">
-                                            <StackPanel>
-                                                <TextBlock Text="{Binding Name}" FontWeight="Medium" Foreground="{StaticResource TextPrimary}" FontSize="12"/>
-                                                <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
-                                            </StackPanel>
+                                        <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Margin="0,0,0,8" Padding="12">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Ellipse Width="8" Height="8" Fill="{StaticResource StatusAmber}" VerticalAlignment="Top" Margin="0,6,12,0"/>
+                                                <StackPanel Grid.Column="1">
+                                                    <TextBlock Text="{Binding Name}" FontWeight="Medium" Foreground="{StaticResource TextPrimary}" FontSize="13" TextWrapping="Wrap" LineHeight="18"/>
+                                                    <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/>
+                                                </StackPanel>
+                                            </Grid>
                                         </Border>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
@@ -309,11 +335,18 @@
                         </TabItem>
 
                         <TabItem Header="Activity" Style="{StaticResource TabBtn}">
-                            <ListBox ItemsSource="{Binding Events}">
+                            <ListBox ItemsSource="{Binding Events}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
-                                        <Border BorderBrush="{StaticResource BorderSubtle}" BorderThickness="0,0,0,1" Padding="4,8">
-                                            <TextBlock Text="{Binding}" Foreground="{StaticResource TextMuted}" FontSize="11" TextWrapping="Wrap"/>
+                                        <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Margin="0,0,0,6" Padding="12,10">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Ellipse Width="6" Height="6" Fill="{StaticResource StatusGreen}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                                <TextBlock Grid.Column="1" Text="{Binding}" Foreground="{StaticResource TextSecondary}" FontSize="12" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                                            </Grid>
                                         </Border>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
