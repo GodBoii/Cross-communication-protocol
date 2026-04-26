@@ -23,9 +23,26 @@ Discovery packets are UDP broadcast JSON objects:
   "platform": "windows",
   "tcp_port": 47828,
   "capabilities": ["file.transfer", "pairing"],
+  "transports": {
+    "wifi": { "available": true, "connected": true, "detail": "Wi-Fi adapter" },
+    "lan": { "available": true, "connected": false, "detail": "Ethernet" },
+    "usb": { "available": false, "connected": false, "detail": "Unavailable" },
+    "bluetooth": { "available": true, "connected": false, "detail": "Bluetooth PAN" },
+    "cloud": { "available": true, "connected": true, "detail": "Internet-capable network present" }
+  },
+  "endpoints": [
+    { "transport": "wifi", "host": "192.168.1.25", "port": 47828 },
+    { "transport": "lan", "host": "10.0.0.12", "port": 47828 }
+  ],
   "timestamp": 1777200000
 }
 ```
+
+Notes:
+
+- `transports` tells peers which connection families are currently detectable on the device.
+- `endpoints` advertises concrete TCP routes the peer can try in priority order.
+- v0 still transfers data over TCP sockets. A `bluetooth` or `usb` route is usable only when that transport exposes IP connectivity, such as PAN, tethering, or USB networking.
 
 ## Control Envelope
 
@@ -128,4 +145,3 @@ The v0 local prototype is intentionally simple so the apps can connect quickly. 
 - Signed messages.
 - Trust store revocation.
 - Permission-scoped feature grants per peer.
-

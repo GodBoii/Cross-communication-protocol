@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ccp.local/schemas/message.schema.json",
   "title": "CCP v0 Message",
+  "$comment": "Discovery packets also include optional transports and endpoints objects for route advertisement.",
   "type": "object",
   "required": ["protocol", "id", "type", "sender", "payload", "timestamp"],
   "properties": {
@@ -21,4 +22,3 @@
     "timestamp": { "type": "number" }
   }
 }
-
