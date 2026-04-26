@@ -15,5 +15,5 @@ public sealed record PeerView
 
     public string EndpointLabel => $"{Platform}  {Address}:{TcpPort}  {(Trusted ? "trusted" : "new")}";
     public string PlatformInitial => string.IsNullOrWhiteSpace(Platform) ? "?" : Platform[..1].ToUpperInvariant();
-    public Brush BadgeBrush => Trusted ? new SolidColorBrush(Color.FromRgb(47, 143, 107)) : new SolidColorBrush(Color.FromRgb(100, 116, 139));
+    public Brush BadgeBrush => Trusted ? new SolidColorBrush(Color.FromRgb(245, 245, 245)) : new SolidColorBrush(Color.FromRgb(99, 99, 99));
 }
