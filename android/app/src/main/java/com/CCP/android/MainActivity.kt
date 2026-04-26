@@ -13,6 +13,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -26,7 +32,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.paddingFromBaseline
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -46,16 +51,19 @@ import androidx.compose.material.icons.rounded.PermDeviceInformation
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.Link
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -63,12 +71,39 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
+
+// ── Obsidian Color Tokens ──
+private val Void = Color(0xFF000000)
+private val Base = Color(0xFF0A0A0A)
+private val Surface1 = Color(0xFF111111)
+private val Surface2 = Color(0xFF171717)
+private val Surface3 = Color(0xFF1E1E1E)
+private val BorderClr = Color(0xFF262626)
+private val TextPrim = Color(0xFFF5F5F5)
+private val TextSec = Color(0xFFA3A3A3)
+private val TextMut = Color(0xFF636363)
+private val StatusGreen = Color(0xFF34D399)
+
+private val ObsidianScheme = darkColorScheme(
+    background = Void,
+    surface = Surface1,
+    surfaceVariant = Surface2,
+    onBackground = TextPrim,
+    onSurface = TextPrim,
+    onSurfaceVariant = TextSec,
+    primary = Color.White,
+    onPrimary = Color.Black,
+    outline = BorderClr
+)
 
 class MainActivity : ComponentActivity() {
     private lateinit var node: CcpNode
@@ -82,8 +117,8 @@ class MainActivity : ComponentActivity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 20)
         }
         setContent {
-            MaterialTheme {
-                Surface(Modifier.fillMaxSize(), color = Color(0xFFF3F5F8)) {
+            MaterialTheme(colorScheme = ObsidianScheme) {
+                Surface(Modifier.fillMaxSize(), color = Void) {
                     CcpScreen(
                         node = node,
                         readPickedFile = ::readPickedFile,
@@ -130,6 +165,19 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// ── Reusable glass card ──
+@Composable
+fun ObsidianCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = Surface1),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, BorderClr)
+    ) {
+        content()
+    }
+}
+
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
 fun CcpScreen(
@@ -155,81 +203,107 @@ fun CcpScreen(
         }
     }
 
+    // Staggered entrance
+    var visible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { delay(100); visible = true }
+
     Column(
         Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(18.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        HeroCard(snapshot)
-
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            StatusPill(Icons.Rounded.Battery6Bar, "Battery", snapshot.battery)
-            StatusPill(Icons.Rounded.Storage, "Storage", snapshot.storage)
-            StatusPill(Icons.Rounded.Notifications, "Alerts", snapshot.notificationAccess)
-            StatusPill(Icons.Rounded.Collections, "Gallery", snapshot.galleryAccess)
+        AnimatedVisibility(visible, enter = fadeIn(tween(350)) + slideInVertically(spring(Spring.DampingRatioLowBouncy)) { -20 }) {
+            HeroCard(snapshot)
         }
 
-        PermissionsCard(
-            snapshot = snapshot,
-            requestMediaAccess = {
-                val permissions = if (Build.VERSION.SDK_INT >= 33) {
-                    arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
-                } else {
-                    arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-                }
-                permissionLauncher.launch(permissions)
-            },
-            openNotificationAccess = openNotificationAccess,
-            openAppNotificationSettings = openAppNotificationSettings
-        )
+        AnimatedVisibility(visible, enter = fadeIn(tween(350, 80)) + slideInVertically(spring(Spring.DampingRatioLowBouncy)) { -16 }) {
+            StatsRow(snapshot)
+        }
 
-        NearbyDevicesCard(peers = peers, onPair = { node.pair(it) }, onInspect = { node.inspectPeer(it) }, onSend = {
-            selectedPeer = it
-            picker.launch(arrayOf("*/*"))
-        })
+        AnimatedVisibility(visible, enter = fadeIn(tween(350, 160))) {
+            PermissionsCard(
+                snapshot = snapshot,
+                requestMediaAccess = {
+                    val permissions = if (Build.VERSION.SDK_INT >= 33) {
+                        arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+                    } else {
+                        arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+                    }
+                    permissionLauncher.launch(permissions)
+                },
+                openNotificationAccess = openNotificationAccess,
+                openAppNotificationSettings = openAppNotificationSettings
+            )
+        }
 
-        RemotePanelCard(remotePanel)
+        AnimatedVisibility(visible, enter = fadeIn(tween(350, 240))) {
+            NearbyDevicesCard(peers = peers, onPair = { node.pair(it) }, onInspect = { node.inspectPeer(it) }, onSend = {
+                selectedPeer = it
+                picker.launch(arrayOf("*/*"))
+            })
+        }
 
-        RecentTransfersCard(recentReceived)
+        AnimatedVisibility(visible, enter = fadeIn(tween(350, 320))) {
+            RemotePanelCard(remotePanel)
+        }
 
-        ActivityCard(events)
+        AnimatedVisibility(visible, enter = fadeIn(tween(350, 400))) {
+            RecentTransfersCard(recentReceived)
+        }
+
+        AnimatedVisibility(visible, enter = fadeIn(tween(350, 480))) {
+            ActivityCard(events)
+        }
     }
 }
 
 @Composable
 fun HeroCard(snapshot: LocalDeviceSnapshot) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF101A2B)),
-        shape = RoundedCornerShape(26.dp)
-    ) {
-        Column(Modifier.fillMaxWidth().padding(22.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("CCP", color = Color.White, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-            Text("Cross-device control surface", color = Color(0xFFC7D2E2), style = MaterialTheme.typography.bodyLarge)
-            Text(snapshot.title, color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-            Text(snapshot.subtitle, color = Color(0xFF9FB0C9), style = MaterialTheme.typography.bodyMedium)
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("CCP", color = TextPrim, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Box(Modifier.background(Surface3, RoundedCornerShape(50)).padding(horizontal = 8.dp, vertical = 2.dp)) {
+                    Text("v0.2", color = TextMut, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+                }
+            }
+            Text("Cross-device control surface", color = TextSec, fontSize = 13.sp)
+            Spacer(Modifier.height(4.dp))
+            Text(snapshot.title, color = TextPrim, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+            Text(snapshot.subtitle, color = TextMut, fontSize = 12.sp)
         }
     }
 }
 
 @Composable
-fun StatusPill(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, value: String) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = Color.White),
-        shape = RoundedCornerShape(18.dp),
-        modifier = Modifier.width(160.dp)
-    ) {
-        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Box(Modifier.size(34.dp).background(Color(0xFFE9EEF8), CircleShape), contentAlignment = Alignment.Center) {
-                Icon(icon, contentDescription = null, tint = Color(0xFF23416A), modifier = Modifier.size(18.dp))
-            }
-            Column {
-                Text(label, color = Color(0xFF69788E), style = MaterialTheme.typography.bodySmall)
-                Text(value, color = Color(0xFF17202E), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-            }
+@OptIn(ExperimentalLayoutApi::class)
+fun StatsRow(snapshot: LocalDeviceSnapshot) {
+    ObsidianCard {
+        Row(Modifier.fillMaxWidth()) {
+            StatCell("Battery", snapshot.battery, Modifier.weight(1f))
+            VertDiv()
+            StatCell("Storage", snapshot.storage, Modifier.weight(1f))
+            VertDiv()
+            StatCell("Alerts", snapshot.notificationAccess, Modifier.weight(1f))
+            VertDiv()
+            StatCell("Gallery", snapshot.galleryAccess, Modifier.weight(1f))
         }
     }
+}
+
+@Composable
+fun StatCell(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(modifier.padding(12.dp, 10.dp)) {
+        Text(label, color = TextMut, fontSize = 10.sp)
+        Text(value, color = TextPrim, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 3.dp))
+    }
+}
+
+@Composable
+fun VertDiv() {
+    Box(Modifier.width(1.dp).height(44.dp).background(BorderClr).padding(vertical = 8.dp))
 }
 
 @Composable
@@ -239,37 +313,36 @@ fun PermissionsCard(
     openNotificationAccess: () -> Unit,
     openAppNotificationSettings: () -> Unit
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(22.dp)) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Permissions and controls", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text("Turn on gallery and notification access so Windows can browse recent media and mirrored alerts.", color = Color(0xFF66758A))
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(onClick = requestMediaAccess, border = BorderStroke(1.dp, Color(0xFFD8E1ED))) {
-                    Icon(Icons.Rounded.Collections, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Text("Gallery access")
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Permissions", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+            Text("Enable gallery and notification access for full functionality.", color = TextMut, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = requestMediaAccess, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec)) {
+                    Icon(Icons.Rounded.Collections, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Gallery", fontSize = 12.sp)
                 }
-                OutlinedButton(onClick = openNotificationAccess, border = BorderStroke(1.dp, Color(0xFFD8E1ED))) {
-                    Icon(Icons.Rounded.Notifications, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Text("Notification access")
+                OutlinedButton(onClick = openNotificationAccess, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec)) {
+                    Icon(Icons.Rounded.Notifications, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Notifications", fontSize = 12.sp)
                 }
             }
-            AssistChip(onClick = openAppNotificationSettings, label = { Text("App notifications") }, leadingIcon = {
-                Icon(Icons.Rounded.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
-            })
-            Text("Current: gallery ${snapshot.galleryAccess.lowercase()} and notifications ${snapshot.notificationAccess.lowercase()}.", color = Color(0xFF66758A))
+            Text("Gallery ${snapshot.galleryAccess.lowercase()} · Notifications ${snapshot.notificationAccess.lowercase()}", color = TextMut, fontSize = 11.sp)
         }
     }
 }
 
 @Composable
 fun NearbyDevicesCard(peers: List<DeviceInfo>, onPair: (DeviceInfo) -> Unit, onInspect: (DeviceInfo) -> Unit, onSend: (DeviceInfo) -> Unit) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(22.dp)) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Nearby devices", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Nearby devices", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
             if (peers.isEmpty()) {
-                Text("Scanning on local Wi-Fi for desktops and phones...", color = Color(0xFF687386), style = MaterialTheme.typography.bodyLarge)
+                Text("Scanning on local Wi-Fi…", color = TextMut, fontSize = 13.sp)
             } else {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     peers.forEach { peer ->
                         DeviceRow(peer = peer, onPair = { onPair(peer) }, onInspect = { onInspect(peer) }, onSend = { onSend(peer) })
                     }
@@ -283,17 +356,25 @@ fun NearbyDevicesCard(peers: List<DeviceInfo>, onPair: (DeviceInfo) -> Unit, onI
 @OptIn(ExperimentalLayoutApi::class)
 fun RemotePanelCard(panel: RemotePeerPanel?) {
     if (panel == null) return
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(22.dp)) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Connected device panel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text(panel.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = Color(0xFF17202E))
-            Text(panel.subtitle, color = Color(0xFF66758A))
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                StatusPill(Icons.Rounded.Battery6Bar, "Battery", panel.battery)
-                StatusPill(Icons.Rounded.Storage, "Storage", panel.storage)
-                StatusPill(Icons.Rounded.Notifications, "Alerts", panel.notificationAccess)
-                StatusPill(Icons.Rounded.DesktopWindows, "Gallery", panel.galleryAccess)
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Connected device", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+            Text(panel.title, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = TextPrim)
+            Text(panel.subtitle, color = TextMut, fontSize = 12.sp)
+
+            // Stats row
+            Card(colors = CardDefaults.cardColors(containerColor = Surface2), shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, BorderClr)) {
+                Row(Modifier.fillMaxWidth()) {
+                    StatCell("Battery", panel.battery, Modifier.weight(1f))
+                    VertDiv()
+                    StatCell("Storage", panel.storage, Modifier.weight(1f))
+                    VertDiv()
+                    StatCell("Alerts", panel.notificationAccess, Modifier.weight(1f))
+                    VertDiv()
+                    StatCell("Gallery", panel.galleryAccess, Modifier.weight(1f))
+                }
             }
+
             SectionList("Settings", panel.settings.map { "${it.label}: ${it.value}" })
             SectionList("Gallery", panel.gallery.map { "${it.name}  ${it.subtitle}" })
             SectionList("Files", panel.files.map { "${it.name}  ${it.subtitle}" })
@@ -304,13 +385,13 @@ fun RemotePanelCard(panel: RemotePeerPanel?) {
 
 @Composable
 fun SectionList(title: String, items: List<String>) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(title, fontWeight = FontWeight.SemiBold, color = Color(0xFF17202E))
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(title, fontWeight = FontWeight.SemiBold, color = TextSec, fontSize = 12.sp)
         if (items.isEmpty()) {
-            Text("Nothing available yet.", color = Color(0xFF66758A))
+            Text("Nothing available yet.", color = TextMut, fontSize = 12.sp)
         } else {
             items.take(5).forEach { item ->
-                Text(item, color = Color(0xFF3D4654))
+                Text(item, color = TextPrim, fontSize = 12.sp)
             }
         }
     }
@@ -318,33 +399,31 @@ fun SectionList(title: String, items: List<String>) {
 
 @Composable
 fun RecentTransfersCard(recentReceived: JSONArray) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(22.dp)) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Received on this phone", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Received files", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
             val items = jsonArrayToList(recentReceived)
             if (items.isEmpty()) {
-                Text("Incoming files and photos will appear here after sync.", color = Color(0xFF687386))
+                Text("Incoming files appear here after sync.", color = TextMut, fontSize = 12.sp)
             } else {
                 items.take(6).forEach { item ->
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .border(1.dp, Color(0xFFE8ECF2), RoundedCornerShape(16.dp))
-                            .padding(12.dp),
+                            .border(1.dp, BorderClr, RoundedCornerShape(10.dp))
+                            .padding(10.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Box(Modifier.size(36.dp).background(Color(0xFFE7EEF8), CircleShape), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(32.dp).background(Surface3, CircleShape), contentAlignment = Alignment.Center) {
                             Icon(
                                 if (item.optString("type") == "gallery") Icons.Rounded.Collections else Icons.Rounded.Storage,
-                                contentDescription = null,
-                                tint = Color(0xFF20406A),
-                                modifier = Modifier.size(18.dp)
+                                contentDescription = null, tint = TextSec, modifier = Modifier.size(16.dp)
                             )
                         }
                         Column(Modifier.weight(1f)) {
-                            Text(item.optString("name"), fontWeight = FontWeight.SemiBold, color = Color(0xFF17202E))
-                            Text(item.optString("location"), color = Color(0xFF66758A), style = MaterialTheme.typography.bodySmall)
+                            Text(item.optString("name"), fontWeight = FontWeight.Medium, color = TextPrim, fontSize = 13.sp)
+                            Text(item.optString("location"), color = TextMut, fontSize = 11.sp)
                         }
                     }
                 }
@@ -355,13 +434,11 @@ fun RecentTransfersCard(recentReceived: JSONArray) {
 
 @Composable
 fun ActivityCard(events: List<String>) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(22.dp)) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Activity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                events.reversed().takeLast(8).reversed().forEach { event ->
-                    Text(event, style = MaterialTheme.typography.bodyMedium, color = Color(0xFF3D4654))
-                }
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Activity", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+            events.reversed().takeLast(8).reversed().forEach { event ->
+                Text(event, fontSize = 12.sp, color = TextMut)
             }
         }
     }
@@ -372,32 +449,26 @@ fun DeviceRow(peer: DeviceInfo, onPair: () -> Unit, onInspect: () -> Unit, onSen
     Row(
         Modifier
             .fillMaxWidth()
-            .border(1.dp, Color(0xFFE8ECF2), RoundedCornerShape(18.dp))
-            .padding(14.dp),
+            .border(1.dp, BorderClr, RoundedCornerShape(10.dp))
+            .padding(10.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Box(
-            modifier = Modifier.size(42.dp).background(if (peer.trusted) Color(0xFF2F8F6B) else Color(0xFF6E7E96), CircleShape),
+            modifier = Modifier.size(34.dp).background(if (peer.trusted) Surface3 else Surface2, RoundedCornerShape(10.dp)),
             contentAlignment = Alignment.Center
         ) {
-            Text(peer.platform.take(1).uppercase(), color = Color.White, fontWeight = FontWeight.Bold)
+            Text(peer.platform.take(1).uppercase(), color = if (peer.trusted) TextPrim else TextMut, fontWeight = FontWeight.Bold, fontSize = 14.sp)
         }
         Column(Modifier.weight(1f)) {
-            Text(peer.deviceName, fontWeight = FontWeight.SemiBold, color = Color(0xFF17202E))
-            Text("${peer.platform}  ${peer.host}:${peer.tcpPort}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF687386))
+            Text(peer.deviceName, fontWeight = FontWeight.SemiBold, color = TextPrim, fontSize = 13.sp)
+            Text("${peer.platform}  ${peer.host}:${peer.tcpPort}", fontSize = 10.sp, color = TextMut)
         }
-        OutlinedButton(onClick = onPair, border = BorderStroke(1.dp, Color(0xFFD8E1ED))) {
-            Icon(Icons.Rounded.Link, contentDescription = null, modifier = Modifier.size(18.dp))
-            Text("Pair")
+        OutlinedButton(onClick = onPair, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec), modifier = Modifier.height(32.dp)) {
+            Text("Pair", fontSize = 11.sp)
         }
-        OutlinedButton(onClick = onInspect, border = BorderStroke(1.dp, Color(0xFFD8E1ED)), enabled = peer.trusted) {
-            Icon(Icons.Rounded.PermDeviceInformation, contentDescription = null, modifier = Modifier.size(18.dp))
-            Text("Inspect")
-        }
-        Button(onClick = onSend, enabled = peer.trusted) {
-            Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = null, modifier = Modifier.size(18.dp))
-            Text("Send")
+        Button(onClick = onSend, enabled = peer.trusted, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black, disabledContainerColor = Surface2, disabledContentColor = TextMut), modifier = Modifier.height(32.dp)) {
+            Text("Send", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
