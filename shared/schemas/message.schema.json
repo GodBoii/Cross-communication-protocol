@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ccp.local/schemas/message.schema.json",
+  "title": "CCP v0 Message",
+  "type": "object",
+  "required": ["protocol", "id", "type", "sender", "payload", "timestamp"],
+  "properties": {
+    "protocol": { "const": "ccp.v0" },
+    "id": { "type": "string" },
+    "type": { "type": "string" },
+    "sender": {
+      "type": "object",
+      "required": ["device_id", "device_name", "platform"],
+      "properties": {
+        "device_id": { "type": "string" },
+        "device_name": { "type": "string" },
+        "platform": { "type": "string" }
+      }
+    },
+    "payload": { "type": "object" },
+    "timestamp": { "type": "number" }
+  }
+}
+
