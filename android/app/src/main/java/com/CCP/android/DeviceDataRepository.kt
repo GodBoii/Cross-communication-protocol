@@ -8,6 +8,8 @@ import android.content.Context
 import android.database.Cursor
 import android.media.MediaScannerConnection
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
@@ -95,7 +97,10 @@ class DeviceDataRepository(private val context: Context) {
             galleryAccess = if (galleryAccessEnabled) "Granted" else "Needs permission",
             settings = listOf(
                 "Wi-Fi" to if (isWifiEnabled()) "On" else "Off",
+                "LAN" to if (isEthernetConnected()) "Connected" else "Unavailable",
+                "USB" to if (isUsbConnected()) "Connected" else "Unavailable",
                 "Bluetooth" to if (isBluetoothEnabled()) "On" else "Off",
+                "Cloud" to if (hasInternetRoute()) "Available" else "Unavailable",
                 "Battery saver" to if (isPowerSaveEnabled()) "On" else "Off",
                 "Device name" to (Build.MODEL ?: "Android")
             )
@@ -229,6 +234,24 @@ class DeviceDataRepository(private val context: Context) {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
         val adapter = manager?.adapter
         return adapter?.isEnabled == true
+    }
+
+    private fun isEthernetConnected(): Boolean {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val capabilities = manager.getNetworkCapabilities(manager.activeNetwork) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
+
+    private fun isUsbConnected(): Boolean {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val capabilities = manager.getNetworkCapabilities(manager.activeNetwork) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_USB)
+    }
+
+    private fun hasInternetRoute(): Boolean {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val capabilities = manager.getNetworkCapabilities(manager.activeNetwork) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     private fun isPowerSaveEnabled(): Boolean {

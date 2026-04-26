@@ -6,7 +6,6 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -51,6 +50,7 @@ import androidx.compose.material.icons.rounded.PermDeviceInformation
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -76,7 +76,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
@@ -121,7 +120,6 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = Void) {
                     CcpScreen(
                         node = node,
-                        readPickedFile = ::readPickedFile,
                         openNotificationAccess = ::openNotificationAccess,
                         openAppNotificationSettings = ::openAppNotificationSettings
                     )
@@ -133,20 +131,6 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         node.refreshLocalData()
-    }
-
-    private fun readPickedFile(uri: Uri): Pair<String, ByteArray> {
-        val name = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
-        } ?: "android-file-${System.currentTimeMillis()}"
-
-        val bytes = contentResolver.openInputStream(uri).use { input ->
-            val output = ByteArrayOutputStream()
-            requireNotNull(input).copyTo(output)
-            output.toByteArray()
-        }
-        return name to bytes
     }
 
     private fun openNotificationAccess() {
@@ -182,7 +166,6 @@ fun ObsidianCard(modifier: Modifier = Modifier, content: @Composable () -> Unit)
 @OptIn(ExperimentalLayoutApi::class)
 fun CcpScreen(
     node: CcpNode,
-    readPickedFile: (Uri) -> Pair<String, ByteArray>,
     openNotificationAccess: () -> Unit,
     openAppNotificationSettings: () -> Unit
 ) {
@@ -198,8 +181,7 @@ fun CcpScreen(
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val peer = selectedPeer
         if (uri != null && peer != null) {
-            val file = readPickedFile(uri)
-            node.sendFile(peer, file.first, file.second)
+            node.sendFile(peer, uri)
         }
     }
 
@@ -327,6 +309,9 @@ fun PermissionsCard(
                     Icon(Icons.Rounded.Notifications, null, Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Notifications", fontSize = 12.sp)
+                }
+                OutlinedButton(onClick = openAppNotificationSettings, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec)) {
+                    Icon(Icons.Rounded.Settings, null, Modifier.size(16.dp))
                 }
             }
             Text("Gallery ${snapshot.galleryAccess.lowercase()} · Notifications ${snapshot.notificationAccess.lowercase()}", color = TextMut, fontSize = 11.sp)
@@ -462,10 +447,14 @@ fun DeviceRow(peer: DeviceInfo, onPair: () -> Unit, onInspect: () -> Unit, onSen
         }
         Column(Modifier.weight(1f)) {
             Text(peer.deviceName, fontWeight = FontWeight.SemiBold, color = TextPrim, fontSize = 13.sp)
-            Text("${peer.platform}  ${peer.host}:${peer.tcpPort}", fontSize = 10.sp, color = TextMut)
+            Text("${peer.platform}  ${peer.primaryRouteLabel}", fontSize = 10.sp, color = TextMut)
+            Text(peer.transportSummary, fontSize = 10.sp, color = TextSec, modifier = Modifier.padding(top = 2.dp))
         }
         OutlinedButton(onClick = onPair, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec), modifier = Modifier.height(32.dp)) {
             Text("Pair", fontSize = 11.sp)
+        }
+        OutlinedButton(onClick = onInspect, enabled = peer.trusted, border = BorderStroke(1.dp, BorderClr), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSec), modifier = Modifier.height(32.dp)) {
+            Icon(Icons.Rounded.Visibility, null, Modifier.size(15.dp))
         }
         Button(onClick = onSend, enabled = peer.trusted, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black, disabledContainerColor = Surface2, disabledContentColor = TextMut), modifier = Modifier.height(32.dp)) {
             Text("Send", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
