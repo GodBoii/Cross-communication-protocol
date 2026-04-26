@@ -7,6 +7,8 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Linq;
+using System.Windows;
 
 namespace CCP.Windows.Services;
 
@@ -131,6 +133,32 @@ public sealed class CcpNode : IDisposable
         _onEvent(complete is not null && AsBool(complete.Payload.GetValueOrDefault("ok"))
             ? $"Sent and verified {file.Name}"
             : $"Receiver verification failed for {file.Name}");
+    }
+
+    public async Task<RemoteDevicePanel> GetPeerPanelAsync(PeerView peer)
+    {
+        if (!peer.Trusted)
+        {
+            return RemoteDevicePanel.Empty(peer.DeviceName, peer.Platform);
+        }
+
+        var snapshot = await RequestPayloadAsync(peer, "device.snapshot.request");
+        var gallery = await RequestPayloadAsync(peer, "gallery.list.request");
+        var files = await RequestPayloadAsync(peer, "files.list.request");
+        var notifications = await RequestPayloadAsync(peer, "notifications.list.request");
+
+        return new RemoteDevicePanel(
+            Title: AsString(snapshot?.GetValueOrDefault("device_title")) ?? peer.DeviceName,
+            Subtitle: AsString(snapshot?.GetValueOrDefault("device_subtitle")) ?? peer.Platform,
+            Battery: AsString(snapshot?.GetValueOrDefault("battery")) ?? "Unknown",
+            Storage: AsString(snapshot?.GetValueOrDefault("storage")) ?? "Unknown",
+            NotificationAccess: AsString(snapshot?.GetValueOrDefault("notification_access")) ?? "Unknown",
+            GalleryAccess: AsString(snapshot?.GetValueOrDefault("gallery_access")) ?? "Unknown",
+            Settings: ParseFacts(snapshot?.GetValueOrDefault("settings")),
+            Gallery: ParseItems(gallery?.GetValueOrDefault("items"), "gallery"),
+            Files: ParseItems(files?.GetValueOrDefault("items"), "file"),
+            Notifications: ParseNotifications(notifications)
+        );
     }
 
     private async Task BroadcastLoopAsync(CancellationToken token)
@@ -275,6 +303,30 @@ public sealed class CcpNode : IDisposable
                         }));
                         _onEvent(ok ? $"Received and verified {target}" : $"Checksum failed for {target}");
                         break;
+
+                    case "device.snapshot.request":
+                        await WriteAsync(writer, Envelope("device.snapshot.response", BuildLocalSnapshotPayload()));
+                        break;
+
+                    case "gallery.list.request":
+                        await WriteAsync(writer, Envelope("gallery.list.response", BuildDirectoryPayload(
+                            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures)),
+                            "gallery")));
+                        break;
+
+                    case "files.list.request":
+                        await WriteAsync(writer, Envelope("files.list.response", BuildDirectoryPayload(
+                            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"),
+                            "file")));
+                        break;
+
+                    case "notifications.list.request":
+                        await WriteAsync(writer, Envelope("notifications.list.response", new()
+                        {
+                            ["permission_granted"] = false,
+                            ["items"] = Array.Empty<object>()
+                        }));
+                        break;
                 }
             }
         }
@@ -293,6 +345,12 @@ public sealed class CcpNode : IDisposable
         await using var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
         await WriteAsync(writer, message);
         return await ReadAsync(reader);
+    }
+
+    private async Task<Dictionary<string, object?>?> RequestPayloadAsync(PeerView peer, string messageType)
+    {
+        var response = await SendSingleAsync(peer, Envelope(messageType, new()));
+        return response?.Payload;
     }
 
     private CcpMessage Envelope(string type, Dictionary<string, object?> payload)
@@ -341,6 +399,67 @@ public sealed class CcpNode : IDisposable
         };
     }
 
+    private static IReadOnlyList<RemoteFactView> ParseFacts(object? value)
+    {
+        var result = new List<RemoteFactView>();
+        if (value is not JsonElement element || element.ValueKind != JsonValueKind.Array)
+        {
+            return result;
+        }
+
+        foreach (var item in element.EnumerateArray())
+        {
+            result.Add(new RemoteFactView(
+                item.GetProperty("label").GetString() ?? "Setting",
+                item.GetProperty("value").GetString() ?? "Unknown"));
+        }
+        return result;
+    }
+
+    private static IReadOnlyList<RemoteContentItem> ParseItems(object? value, string fallbackType)
+    {
+        var result = new List<RemoteContentItem>();
+        if (value is not JsonElement element || element.ValueKind != JsonValueKind.Array)
+        {
+            return result;
+        }
+
+        foreach (var item in element.EnumerateArray())
+        {
+            var subtitle = item.TryGetProperty("location", out var location)
+                ? location.GetString()
+                : item.TryGetProperty("mime_type", out var mimeType)
+                    ? mimeType.GetString()
+                    : item.TryGetProperty("size", out var size)
+                        ? size.ToString()
+                        : fallbackType;
+
+            result.Add(new RemoteContentItem(
+                item.TryGetProperty("name", out var name) ? name.GetString() ?? "Untitled" : "Untitled",
+                subtitle ?? fallbackType,
+                item.TryGetProperty("type", out var type) ? type.GetString() ?? fallbackType : fallbackType));
+        }
+        return result;
+    }
+
+    private static IReadOnlyList<RemoteContentItem> ParseNotifications(Dictionary<string, object?>? payload)
+    {
+        var result = new List<RemoteContentItem>();
+        if (payload?.TryGetValue("items", out var itemsValue) != true || itemsValue is not JsonElement element || element.ValueKind != JsonValueKind.Array)
+        {
+            return result;
+        }
+
+        foreach (var item in element.EnumerateArray())
+        {
+            result.Add(new RemoteContentItem(
+                item.TryGetProperty("title", out var title) ? title.GetString() ?? "Notification" : "Notification",
+                item.TryGetProperty("text", out var text) ? text.GetString() ?? "" : "",
+                "notification"));
+        }
+        return result;
+    }
+
     private static string Sha256Bytes(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 
     private static async Task<string> Sha256FileAsync(string path)
@@ -366,6 +485,67 @@ public sealed class CcpNode : IDisposable
             var candidate = Path.Combine(dir, $"{name}-{i}{ext}");
             if (!File.Exists(candidate)) return candidate;
         }
+    }
+
+    private Dictionary<string, object?> BuildLocalSnapshotPayload()
+    {
+        var settings = new List<Dictionary<string, string>>
+        {
+            new() { ["label"] = "Operating system", ["value"] = Environment.OSVersion.VersionString },
+            new() { ["label"] = "Machine name", ["value"] = Environment.MachineName },
+            new() { ["label"] = "User", ["value"] = Environment.UserName },
+            new() { ["label"] = "Power", ["value"] = SystemParameters.PowerLineStatus.ToString() }
+        };
+
+        var drive = new DriveInfo(Path.GetPathRoot(Environment.SystemDirectory)!);
+        var storage = drive.IsReady
+            ? $"{FormatBytes(drive.TotalSize - drive.AvailableFreeSpace)} used / {FormatBytes(drive.TotalSize)}"
+            : "Unavailable";
+
+        return new Dictionary<string, object?>
+        {
+            ["device_title"] = _config.DeviceName,
+            ["device_subtitle"] = "Windows desktop",
+            ["battery"] = SystemParameters.PowerLineStatus == PowerLineStatus.Online ? "AC power" : "Portable",
+            ["storage"] = storage,
+            ["notification_access"] = "Not connected",
+            ["gallery_access"] = "Granted",
+            ["settings"] = settings
+        };
+    }
+
+    private static Dictionary<string, object?> BuildDirectoryPayload(string directoryPath, string type)
+    {
+        var items = Directory.Exists(directoryPath)
+            ? Directory.GetFiles(directoryPath)
+                .Select(path => new FileInfo(path))
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .Take(18)
+                .Select(file => new Dictionary<string, object?>
+                {
+                    ["name"] = file.Name,
+                    ["location"] = file.DirectoryName ?? directoryPath,
+                    ["size"] = file.Length,
+                    ["type"] = type
+                })
+                .Cast<object>()
+                .ToArray()
+            : Array.Empty<object>();
+
+        return new Dictionary<string, object?> { ["items"] = items };
+    }
+
+    private static string FormatBytes(long value)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        var size = (double)value;
+        var order = 0;
+        while (size >= 1024 && order < units.Length - 1)
+        {
+            order++;
+            size /= 1024;
+        }
+        return $"{size:0.#} {units[order]}";
     }
 
     public void Dispose()
