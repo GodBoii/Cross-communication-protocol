@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Deep void base -->
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#050510" />
+        </shape>
+    </item>
+    <!-- Top-left violet bloom -->
+    <item>
+        <shape android:shape="oval">
+            <gradient
+                android:type="radial"
+                android:gradientRadius="600dp"
+                android:centerX="0.15"
+                android:centerY="0.1"
+                android:startColor="#331a0533"
+                android:endColor="#00000000" />
+        </shape>
+    </item>
+    <!-- Center teal wash -->
+    <item>
+        <shape android:shape="oval">
+            <gradient
+                android:type="radial"
+                android:gradientRadius="700dp"
+                android:centerX="0.5"
+                android:centerY="0.45"
+                android:startColor="#220a1628"
+                android:endColor="#00000000" />
+        </shape>
+    </item>
+    <!-- Bottom-right cyan glow -->
+    <item>
+        <shape android:shape="oval">
+            <gradient
+                android:type="radial"
+                android:gradientRadius="500dp"
+                android:centerX="0.85"
+                android:centerY="0.9"
+                android:startColor="#22051520"
+                android:endColor="#00000000" />
+        </shape>
+    </item>
+</layer-list>
