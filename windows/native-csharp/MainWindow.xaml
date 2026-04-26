@@ -109,6 +109,7 @@
                                         <StackPanel Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center">
                                             <TextBlock Text="{Binding DeviceName}" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}"/>
                                             <TextBlock Text="{Binding EndpointLabel}" FontSize="10" Foreground="{StaticResource TextMuted}" Margin="0,2,0,0" FontFamily="{StaticResource Mono}"/>
+                                            <TextBlock Text="{Binding TransportSummary}" FontSize="10" Foreground="{StaticResource TextSecondary}" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
                                         </StackPanel>
                                         <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
                                             <Button Content="Pair" Command="{Binding DataContext.PairCommand, RelativeSource={RelativeSource AncestorType=ListBox}}" CommandParameter="{Binding}" Padding="10,5" FontSize="11" Margin="0,0,4,0"/>
@@ -241,6 +242,18 @@
                                                 <TextBlock Text="{Binding Name}" FontWeight="Medium" Foreground="{StaticResource TextPrimary}" FontSize="12"/>
                                                 <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
                                             </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </TabItem>
+
+                        <TabItem Header="Activity" Style="{StaticResource TabBtn}">
+                            <ListBox ItemsSource="{Binding Events}">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border BorderBrush="{StaticResource BorderSubtle}" BorderThickness="0,0,0,1" Padding="4,8">
+                                            <TextBlock Text="{Binding}" Foreground="{StaticResource TextMuted}" FontSize="11" TextWrapping="Wrap"/>
                                         </Border>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
