@@ -30,6 +30,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public ObservableCollection<RemoteContentItem> NotificationItems { get; } = [];
 
     public ICommand PairCommand { get; }
+    public ICommand InspectCommand { get; }
     public ICommand SendFileCommand { get; }
     public ICommand RefreshCommand { get; }
     public ICommand RefreshPanelCommand { get; }
@@ -42,6 +43,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         get => _selectedPeer;
         set
         {
+            if (_selectedPeer?.DeviceId == value?.DeviceId && _selectedPeer?.Trusted == value?.Trusted)
+            {
+                _selectedPeer = value;
+                OnPropertyChanged();
+                return;
+            }
             _selectedPeer = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(IsPeerSelected));
@@ -109,12 +116,33 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _node = new CcpNode(
             onPeers: peers => Dispatcher.Invoke(() =>
             {
-                var selectedId = SelectedPeer?.DeviceId;
-                Peers.Clear();
-                foreach (var peer in peers) Peers.Add(peer);
-                if (selectedId is not null)
+                var currentIds = peers.Select(p => p.DeviceId).ToHashSet();
+                for (int i = Peers.Count - 1; i >= 0; i--)
                 {
-                    SelectedPeer = Peers.FirstOrDefault(p => p.DeviceId == selectedId);
+                    if (!currentIds.Contains(Peers[i].DeviceId))
+                        Peers.RemoveAt(i);
+                }
+
+                foreach (var peer in peers)
+                {
+                    var existing = Peers.FirstOrDefault(p => p.DeviceId == peer.DeviceId);
+                    if (existing == null)
+                    {
+                        Peers.Add(peer);
+                    }
+                    else if (existing != peer)
+                    {
+                        var index = Peers.IndexOf(existing);
+                        Peers[index] = peer;
+                    }
+                }
+
+                if (_selectedPeer is null) return;
+                var updatedSelected = Peers.FirstOrDefault(p => p.DeviceId == _selectedPeer.DeviceId);
+                if (updatedSelected != null && updatedSelected != _selectedPeer)
+                {
+                    _selectedPeer = updatedSelected;
+                    OnPropertyChanged(nameof(SelectedPeer));
                 }
             }),
             onEvent: message => Dispatcher.Invoke(() =>
@@ -128,6 +156,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 MessageBox.Show(this, message, title, MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes));
 
         PairCommand = new RelayCommand<PeerView>(peer => _ = PairPeerAsync(peer), peer => peer is not null);
+        InspectCommand = new RelayCommand<PeerView>(peer => SelectedPeer = peer, peer => peer?.Trusted == true);
         SendFileCommand = new RelayCommand<PeerView>(SendFile, peer => peer?.Trusted == true);
         RefreshCommand = new RelayCommand<object>(_ => _node.BroadcastNow());
         RefreshPanelCommand = new RelayCommand<object>(_ => _ = LoadPeerPanelAsync(), _ => SelectedPeer?.Trusted == true);

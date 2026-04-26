@@ -34,15 +34,38 @@
         </EventTrigger>
     </Window.Triggers>
 
-    <Grid Margin="14">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+    <Grid>
+        <!-- ── LQIUD GLASS MESH BACKGROUND ── -->
+        <Rectangle Fill="#030305" />
+        <Rectangle>
+            <Rectangle.Fill>
+                <RadialGradientBrush Center="0.1,0.1" GradientOrigin="0.1,0.1" RadiusX="0.8" RadiusY="0.8">
+                    <GradientStop Color="#401E112A" Offset="0" />
+                    <GradientStop Color="#00000000" Offset="1" />
+                </RadialGradientBrush>
+            </Rectangle.Fill>
+        </Rectangle>
+        <Rectangle>
+            <Rectangle.Fill>
+                <RadialGradientBrush Center="0.9,0.9" GradientOrigin="0.9,0.9" RadiusX="0.8" RadiusY="0.8">
+                    <GradientStop Color="#400D1424" Offset="0" />
+                    <GradientStop Color="#00000000" Offset="1" />
+                </RadialGradientBrush>
+            </Rectangle.Fill>
+        </Rectangle>
+
+        <Grid Margin="18">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
 
         <!-- ═══ SLIM HEADER ═══ -->
-        <Border x:Name="Header" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R10}" Padding="20,12" Margin="0,0,0,10">
+        <Border x:Name="Header" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R14}" Padding="20,14" Margin="0,0,0,14">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="20" ShadowDepth="4" Opacity="0.15" Color="Black"/>
+            </Border.Effect>
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
@@ -73,15 +96,18 @@
         </Border>
 
         <!-- ═══ CONTENT ═══ -->
-        <Grid Grid.Row="1" Margin="0,0,0,10">
+        <Grid Grid.Row="1" Margin="0,0,0,14">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="290"/>
-                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="380"/> <!-- Increased width for buttons -->
+                <ColumnDefinition Width="14"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
             <!-- ─── SIDEBAR ─── -->
-            <Border x:Name="Sidebar" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R10}" Padding="14">
+            <Border x:Name="Sidebar" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R14}" Padding="18">
+                <Border.Effect>
+                    <DropShadowEffect BlurRadius="25" ShadowDepth="6" Opacity="0.2" Color="Black"/>
+                </Border.Effect>
                 <Border.RenderTransform><TranslateTransform x:Name="SidebarSlide" Y="14"/></Border.RenderTransform>
                 <Grid>
                     <Grid.RowDefinitions>
@@ -93,27 +119,58 @@
                         <TextBlock Text="Pair once, then browse from desktop." Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,4,0,0"/>
                     </StackPanel>
 
-                    <ListBox Grid.Row="1" ItemsSource="{Binding Peers}" SelectedItem="{Binding SelectedPeer}">
+                    <ListBox Grid.Row="1" ItemsSource="{Binding Peers}" SelectedItem="{Binding SelectedPeer}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate DataType="{x:Type models:PeerView}">
-                                <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Margin="0,0,0,6" Padding="10">
+                                <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R10}" Margin="0,0,0,8" Padding="10">
                                     <Grid>
                                         <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="36"/>
+                                            <ColumnDefinition Width="38"/>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="Auto"/>
                                         </Grid.ColumnDefinitions>
-                                        <Border Width="30" Height="30" CornerRadius="{StaticResource R8}" Background="{StaticResource Surface3}" VerticalAlignment="Center">
-                                            <TextBlock Text="{Binding PlatformInitial}" Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="Bold" FontSize="13"/>
+                                        <Border Width="34" Height="34" CornerRadius="{StaticResource R10}" Background="{StaticResource Surface3}" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding PlatformInitial}" Foreground="{StaticResource TextPrimary}" HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="Bold" FontSize="14"/>
                                         </Border>
                                         <StackPanel Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center">
-                                            <TextBlock Text="{Binding DeviceName}" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}"/>
-                                            <TextBlock Text="{Binding EndpointLabel}" FontSize="10" Foreground="{StaticResource TextMuted}" Margin="0,2,0,0" FontFamily="{StaticResource Mono}"/>
-                                            <TextBlock Text="{Binding TransportSummary}" FontSize="10" Foreground="{StaticResource TextSecondary}" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
+                                            <TextBlock Text="{Binding DeviceName}" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}" TextTrimming="CharacterEllipsis" MaxWidth="120" HorizontalAlignment="Left"/>
+                                            <TextBlock Text="{Binding EndpointLabel}" FontSize="10" Foreground="{StaticResource TextMuted}" Margin="0,2,0,0" FontFamily="{StaticResource Mono}" TextTrimming="CharacterEllipsis" MaxWidth="140" HorizontalAlignment="Left"/>
+                                            <TextBlock Text="{Binding TransportSummary}" FontSize="10" Foreground="{StaticResource TextSecondary}" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" MaxWidth="140" HorizontalAlignment="Left"/>
                                         </StackPanel>
-                                        <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                                            <Button Content="Pair" Command="{Binding DataContext.PairCommand, RelativeSource={RelativeSource AncestorType=ListBox}}" CommandParameter="{Binding}" Padding="10,5" FontSize="11" Margin="0,0,4,0"/>
-                                            <Button Content="Send" Command="{Binding DataContext.SendFileCommand, RelativeSource={RelativeSource AncestorType=ListBox}}" CommandParameter="{Binding}" Style="{StaticResource AccentBtn}" Padding="10,5" FontSize="11" IsEnabled="{Binding Trusted}"/>
+                                        <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="6,0,0,0">
+                                            <Button Content="Pair" Command="{Binding DataContext.PairCommand, RelativeSource={RelativeSource AncestorType=ListBox}}" CommandParameter="{Binding}" Padding="10,5" FontSize="11" Margin="0,0,4,0">
+                                                <Button.Style>
+                                                    <Style TargetType="Button" BasedOn="{StaticResource GhostBtn}">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Trusted}" Value="True">
+                                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Button.Style>
+                                            </Button>
+                                            <Button Content="Inspect" Command="{Binding DataContext.InspectCommand, RelativeSource={RelativeSource AncestorType=ListBox}}" CommandParameter="{Binding}" Padding="10,5" FontSize="11" Margin="0,0,4,0">
+                                                <Button.Style>
+                                                    <Style TargetType="Button" BasedOn="{StaticResource GhostBtn}">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Trusted}" Value="False">
+                                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Button.Style>
+                                            </Button>
+                                            <Button Content="Send" Command="{Binding DataContext.SendFileCommand, RelativeSource={RelativeSource AncestorType=ListBox}}" CommandParameter="{Binding}" Padding="12,5" FontSize="11">
+                                                <Button.Style>
+                                                    <Style TargetType="Button" BasedOn="{StaticResource AccentBtn}">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Trusted}" Value="False">
+                                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Button.Style>
+                                            </Button>
                                         </StackPanel>
                                     </Grid>
                                 </Border>
@@ -124,7 +181,10 @@
             </Border>
 
             <!-- ─── MAIN PANEL ─── -->
-            <Border x:Name="Main" Grid.Column="2" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R10}" Padding="18,14">
+            <Border x:Name="Main" Grid.Column="2" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R14}" Padding="22,18">
+                <Border.Effect>
+                    <DropShadowEffect BlurRadius="25" ShadowDepth="6" Opacity="0.2" Color="Black"/>
+                </Border.Effect>
                 <Border.RenderTransform><TranslateTransform x:Name="MainSlide" Y="14"/></Border.RenderTransform>
                 <Grid>
                     <Grid.RowDefinitions>
@@ -265,11 +325,15 @@
         </Grid>
 
         <!-- ═══ FOOTER ═══ -->
-        <Border x:Name="Footer" Grid.Row="2" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Padding="14,8">
+        <Border x:Name="Footer" Grid.Row="2" Opacity="0" Background="{StaticResource Surface1}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R10}" Padding="16,10">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="15" ShadowDepth="3" Opacity="0.15" Color="Black"/>
+            </Border.Effect>
             <StackPanel Orientation="Horizontal">
                 <Ellipse Width="6" Height="6" Fill="{StaticResource StatusGreen}" Margin="0,0,10,0" VerticalAlignment="Center"/>
                 <TextBlock Text="{Binding FooterStatus}" Foreground="{StaticResource TextMuted}" FontSize="11" FontFamily="{StaticResource Mono}"/>
             </StackPanel>
         </Border>
+    </Grid>
     </Grid>
 </Window>
