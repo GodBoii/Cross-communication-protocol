@@ -2,12 +2,13 @@ using CCP.Windows.Models;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Linq;
 using System.Windows;
 
 namespace CCP.Windows.Services;
@@ -18,6 +19,8 @@ public sealed class CcpNode : IDisposable
     private const int UdpPort = 47827;
     private const int TcpPort = 47828;
     private const int ChunkSize = 64 * 1024;
+    private const int StalePeerSeconds = 20;
+    private const int ConnectTimeoutMs = 2500;
 
     private readonly ConfigStore _config = new();
     private readonly ConcurrentDictionary<string, PeerView> _peers = new();
@@ -76,13 +79,13 @@ public sealed class CcpNode : IDisposable
             _onEvent("Pair with the device before sending files.");
             return;
         }
+
         var file = new FileInfo(path);
         var transferId = Guid.NewGuid().ToString();
         var fullHash = await Sha256FileAsync(path);
         var totalChunks = (int)((file.Length + ChunkSize - 1) / ChunkSize);
 
-        using var socket = new TcpClient();
-        await socket.ConnectAsync(peer.Address, peer.TcpPort);
+        using var socket = await ConnectPeerAsync(peer);
         await using var stream = socket.GetStream();
         using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
         await using var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
@@ -157,8 +160,7 @@ public sealed class CcpNode : IDisposable
             Settings: ParseFacts(snapshot?.GetValueOrDefault("settings")),
             Gallery: ParseItems(gallery?.GetValueOrDefault("items"), "gallery"),
             Files: ParseItems(files?.GetValueOrDefault("items"), "file"),
-            Notifications: ParseNotifications(notifications)
-        );
+            Notifications: ParseNotifications(notifications));
     }
 
     private async Task BroadcastLoopAsync(CancellationToken token)
@@ -166,6 +168,7 @@ public sealed class CcpNode : IDisposable
         while (!token.IsCancellationRequested)
         {
             await SendDiscoveryAsync();
+            PruneStalePeers();
             await Task.Delay(TimeSpan.FromSeconds(3), token).ContinueWith(_ => { });
         }
     }
@@ -181,7 +184,9 @@ public sealed class CcpNode : IDisposable
             ["device_name"] = _config.DeviceName,
             ["platform"] = "windows",
             ["tcp_port"] = TcpPort,
-            ["capabilities"] = new[] { "pairing", "file.transfer", "native.windows" },
+            ["capabilities"] = new[] { "pairing", "file.transfer", "device.snapshot", "gallery.list", "files.list", "notifications.list", "native.windows" },
+            ["transports"] = BuildTransportPayload(),
+            ["endpoints"] = BuildEndpointPayload(),
             ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
         });
         var bytes = Encoding.UTF8.GetBytes(packet);
@@ -195,9 +200,11 @@ public sealed class CcpNode : IDisposable
         {
             var result = await udp.ReceiveAsync(token);
             var doc = JsonDocument.Parse(result.Buffer).RootElement;
-            if (doc.GetProperty("protocol").GetString() != Protocol) continue;
+            if (!doc.TryGetProperty("protocol", out var protocol) || protocol.GetString() != Protocol) continue;
             var deviceId = doc.GetProperty("device_id").GetString() ?? "";
             if (deviceId == _config.DeviceId) continue;
+
+            var routes = ParseRoutes(doc, result.RemoteEndPoint.Address);
             UpsertPeer(new PeerView
             {
                 DeviceId = deviceId,
@@ -206,7 +213,9 @@ public sealed class CcpNode : IDisposable
                 Address = result.RemoteEndPoint.Address,
                 TcpPort = doc.GetProperty("tcp_port").GetInt32(),
                 Trusted = _config.IsTrusted(deviceId),
-                LastSeen = DateTime.Now
+                LastSeen = DateTime.Now,
+                AvailableTransports = ParseTransportModes(doc),
+                Routes = routes
             });
         }
     }
@@ -216,16 +225,24 @@ public sealed class CcpNode : IDisposable
         var listener = new TcpListener(IPAddress.Any, TcpPort);
         listener.Start();
         _onEvent($"TCP listener active on {TcpPort}");
-        while (!token.IsCancellationRequested)
+        try
         {
-            var client = await listener.AcceptTcpClientAsync(token);
-            _ = Task.Run(() => HandleClientAsync(client, token), token);
+            while (!token.IsCancellationRequested)
+            {
+                var client = await listener.AcceptTcpClientAsync(token);
+                _ = Task.Run(() => HandleClientAsync(client, token), token);
+            }
+        }
+        finally
+        {
+            listener.Stop();
         }
     }
 
     private async Task HandleClientAsync(TcpClient client, CancellationToken token)
     {
         using var socket = client;
+        socket.NoDelay = true;
         await using var stream = socket.GetStream();
         using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
         await using var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
@@ -338,8 +355,7 @@ public sealed class CcpNode : IDisposable
 
     private async Task<CcpMessage?> SendSingleAsync(PeerView peer, CcpMessage message)
     {
-        using var client = new TcpClient();
-        await client.ConnectAsync(peer.Address, peer.TcpPort);
+        using var client = await ConnectPeerAsync(peer);
         await using var stream = client.GetStream();
         using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
         await using var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
@@ -351,6 +367,51 @@ public sealed class CcpNode : IDisposable
     {
         var response = await SendSingleAsync(peer, Envelope(messageType, new()));
         return response?.Payload;
+    }
+
+    private async Task<TcpClient> ConnectPeerAsync(PeerView peer)
+    {
+        Exception? lastError = null;
+        foreach (var route in RankRoutes(peer))
+        {
+            try
+            {
+                var client = new TcpClient { NoDelay = true };
+                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                connectCts.CancelAfter(ConnectTimeoutMs);
+                await client.ConnectAsync(route.Host, route.Port, connectCts.Token);
+                _onEvent($"Connected to {peer.DeviceName} via {route.Transport}");
+                return client;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+        }
+
+        throw new IOException($"Could not connect to {peer.DeviceName}. {lastError?.Message}", lastError);
+    }
+
+    private IEnumerable<PeerRoute> RankRoutes(PeerView peer)
+    {
+        var routes = peer.Routes.Count > 0
+            ? peer.Routes
+            : [new PeerRoute { Transport = "direct", Host = peer.Address.ToString(), Port = peer.TcpPort }];
+
+        var priority = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["usb"] = 0,
+            ["wifi"] = 1,
+            ["lan"] = 2,
+            ["bluetooth"] = 3,
+            ["cloud"] = 4,
+            ["direct"] = 5
+        };
+
+        return routes
+            .GroupBy(route => $"{route.Transport}|{route.Host}|{route.Port}", StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .OrderBy(route => priority.TryGetValue(route.Transport, out var rank) ? rank : 99);
     }
 
     private CcpMessage Envelope(string type, Dictionary<string, object?> payload)
@@ -372,7 +433,207 @@ public sealed class CcpNode : IDisposable
     private void UpsertPeer(PeerView peer)
     {
         _peers[peer.DeviceId] = peer;
+        PublishPeers();
+    }
+
+    private void PruneStalePeers()
+    {
+        var cutoff = DateTime.Now.AddSeconds(-StalePeerSeconds);
+        var removed = false;
+        foreach (var entry in _peers.ToArray())
+        {
+            if (entry.Value.LastSeen < cutoff && _peers.TryRemove(entry.Key, out _))
+            {
+                removed = true;
+            }
+        }
+
+        if (removed)
+        {
+            PublishPeers();
+        }
+    }
+
+    private void PublishPeers()
+    {
         _onPeers(_peers.Values.OrderByDescending(p => p.LastSeen).ToList());
+    }
+
+    private Dictionary<string, object?> BuildTransportPayload()
+    {
+        return DetectTransportStatus()
+            .ToDictionary(
+                item => item.Key,
+                item => (object?)new Dictionary<string, object?>
+                {
+                    ["available"] = item.Value.Available,
+                    ["connected"] = item.Value.Connected,
+                    ["detail"] = item.Value.Detail
+                },
+                StringComparer.OrdinalIgnoreCase);
+    }
+
+    private object[] BuildEndpointPayload()
+    {
+        return DetectAdvertisedRoutes()
+            .Select(route => new Dictionary<string, object?>
+            {
+                ["transport"] = route.Transport,
+                ["host"] = route.Host,
+                ["port"] = route.Port
+            })
+            .Cast<object>()
+            .ToArray();
+    }
+
+    private Dictionary<string, TransportStatus> DetectTransportStatus()
+    {
+        var adapters = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(nic => nic.OperationalStatus == OperationalStatus.Up)
+            .ToList();
+
+        var wifi = adapters.Where(nic => nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211).ToList();
+        var ethernet = adapters.Where(nic =>
+            nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
+            nic.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ||
+            nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetFx ||
+            nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT).ToList();
+        var usb = adapters.Where(IsUsbInterface).ToList();
+        var bluetooth = adapters.Where(IsBluetoothInterface).ToList();
+        var cloudAvailable = adapters.Any(HasUsableIpv4Address);
+
+        return new Dictionary<string, TransportStatus>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["wifi"] = new(wifi.Count > 0, wifi.Any(HasUsableIpv4Address), DescribeAdapters(wifi)),
+            ["lan"] = new(ethernet.Count > 0, ethernet.Any(HasUsableIpv4Address), DescribeAdapters(ethernet)),
+            ["usb"] = new(usb.Count > 0, usb.Any(HasUsableIpv4Address), DescribeAdapters(usb)),
+            ["bluetooth"] = new(bluetooth.Count > 0, bluetooth.Any(HasUsableIpv4Address), DescribeAdapters(bluetooth)),
+            ["cloud"] = new(cloudAvailable, NetworkInterface.GetIsNetworkAvailable(), cloudAvailable ? "Internet-capable network present" : "No routable network")
+        };
+    }
+
+    private IReadOnlyList<PeerRoute> DetectAdvertisedRoutes()
+    {
+        var routes = new List<PeerRoute>();
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up))
+        {
+            var transport = ClassifyTransport(nic);
+            foreach (var address in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (address.Address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(address.Address))
+                {
+                    continue;
+                }
+
+                routes.Add(new PeerRoute
+                {
+                    Transport = transport,
+                    Host = address.Address.ToString(),
+                    Port = TcpPort
+                });
+            }
+        }
+
+        return routes
+            .GroupBy(route => $"{route.Transport}|{route.Host}|{route.Port}", StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+    }
+
+    private static IReadOnlyList<string> ParseTransportModes(JsonElement doc)
+    {
+        if (!doc.TryGetProperty("transports", out var transports) || transports.ValueKind != JsonValueKind.Object)
+        {
+            return [];
+        }
+
+        return transports.EnumerateObject()
+            .Where(item =>
+                item.Value.ValueKind == JsonValueKind.Object &&
+                item.Value.TryGetProperty("available", out var available) &&
+                available.ValueKind == JsonValueKind.True)
+            .Select(item => item.Name)
+            .ToList();
+    }
+
+    private static IReadOnlyList<PeerRoute> ParseRoutes(JsonElement doc, IPAddress fallbackAddress)
+    {
+        var routes = new List<PeerRoute>();
+        var fallbackPort = doc.TryGetProperty("tcp_port", out var portElement) ? portElement.GetInt32() : TcpPort;
+
+        if (doc.TryGetProperty("endpoints", out var endpoints) && endpoints.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var endpoint in endpoints.EnumerateArray())
+            {
+                var host = endpoint.TryGetProperty("host", out var hostElement) ? hostElement.GetString() : null;
+                var transport = endpoint.TryGetProperty("transport", out var transportElement) ? transportElement.GetString() : null;
+                var port = endpoint.TryGetProperty("port", out var endpointPortElement) ? endpointPortElement.GetInt32() : fallbackPort;
+                if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(transport))
+                {
+                    continue;
+                }
+
+                routes.Add(new PeerRoute
+                {
+                    Transport = transport,
+                    Host = host,
+                    Port = port
+                });
+            }
+        }
+
+        if (routes.Count == 0)
+        {
+            routes.Add(new PeerRoute
+            {
+                Transport = "direct",
+                Host = fallbackAddress.ToString(),
+                Port = fallbackPort
+            });
+        }
+
+        return routes;
+    }
+
+    private static bool HasUsableIpv4Address(NetworkInterface nic)
+    {
+        return nic.GetIPProperties().UnicastAddresses.Any(address =>
+            address.Address.AddressFamily == AddressFamily.InterNetwork &&
+            !IPAddress.IsLoopback(address.Address));
+    }
+
+    private static bool IsUsbInterface(NetworkInterface nic)
+    {
+        var text = $"{nic.Name} {nic.Description}";
+        return text.Contains("usb", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("rndis", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBluetoothInterface(NetworkInterface nic)
+    {
+        var text = $"{nic.Name} {nic.Description}";
+        return text.Contains("bluetooth", StringComparison.OrdinalIgnoreCase) ||
+               nic.NetworkInterfaceType == NetworkInterfaceType.Ppp;
+    }
+
+    private static string ClassifyTransport(NetworkInterface nic)
+    {
+        if (IsUsbInterface(nic)) return "usb";
+        if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) return "wifi";
+        if (IsBluetoothInterface(nic)) return "bluetooth";
+        if (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
+            nic.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ||
+            nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetFx ||
+            nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT)
+        {
+            return "lan";
+        }
+        return "cloud";
+    }
+
+    private static string DescribeAdapters(IReadOnlyCollection<NetworkInterface> adapters)
+    {
+        return adapters.Count == 0 ? "Unavailable" : string.Join(", ", adapters.Take(2).Select(adapter => adapter.Name));
     }
 
     private static bool AsBool(object? value)
@@ -489,12 +750,19 @@ public sealed class CcpNode : IDisposable
 
     private Dictionary<string, object?> BuildLocalSnapshotPayload()
     {
+        var transports = DetectTransportStatus();
         var settings = new List<Dictionary<string, string>>
         {
             new() { ["label"] = "Operating system", ["value"] = Environment.OSVersion.VersionString },
             new() { ["label"] = "Machine name", ["value"] = Environment.MachineName },
             new() { ["label"] = "User", ["value"] = Environment.UserName },
-            new() { ["label"] = "Power", ["value"] = SystemParameters.PowerLineStatus.ToString() }
+            new() { ["label"] = "Power", ["value"] = SystemParameters.PowerLineStatus.ToString() },
+            new() { ["label"] = "Routes", ["value"] = string.Join(", ", DetectAdvertisedRoutes().Select(route => route.Transport).Distinct()) },
+            new() { ["label"] = "Wi-Fi", ["value"] = FormatTransport(transports, "wifi") },
+            new() { ["label"] = "LAN", ["value"] = FormatTransport(transports, "lan") },
+            new() { ["label"] = "USB", ["value"] = FormatTransport(transports, "usb") },
+            new() { ["label"] = "Bluetooth", ["value"] = FormatTransport(transports, "bluetooth") },
+            new() { ["label"] = "Cloud", ["value"] = FormatTransport(transports, "cloud") }
         };
 
         var drive = new DriveInfo(Path.GetPathRoot(Environment.SystemDirectory)!);
@@ -512,6 +780,13 @@ public sealed class CcpNode : IDisposable
             ["gallery_access"] = "Granted",
             ["settings"] = settings
         };
+    }
+
+    private static string FormatTransport(IReadOnlyDictionary<string, TransportStatus> transports, string key)
+    {
+        return transports.TryGetValue(key, out var status)
+            ? status.Connected ? $"Connected ({status.Detail})" : status.Available ? $"Available ({status.Detail})" : status.Detail
+            : "Unknown";
     }
 
     private static Dictionary<string, object?> BuildDirectoryPayload(string directoryPath, string type)
