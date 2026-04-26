@@ -4,7 +4,6 @@ C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\App.
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\GeneratedInternalTypeHelper.g.cs
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\CCP.Windows_MarkupCompile.cache
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\CCP.Windows_MarkupCompile.lref
-C:\Users\prajw\Downloads\CCP\windows\native-csharp\bin\Debug\net8.0-windows\CCP.Windows.exe
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\bin\Debug\net8.0-windows\CCP.Windows.deps.json
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\bin\Debug\net8.0-windows\CCP.Windows.runtimeconfig.json
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\bin\Debug\net8.0-windows\CCP.Windows.dll
@@ -20,3 +19,5 @@ C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\refi
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\CCP.Windows.pdb
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\CCP.Windows.genruntimeconfig.cache
 C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\ref\CCP.Windows.dll
+C:\Users\prajw\Downloads\CCP\windows\native-csharp\obj\Debug\net8.0-windows\CCP.Windows.sourcelink.json
+C:\Users\prajw\Downloads\CCP\windows\native-csharp\bin\Debug\net8.0-windows\CCP.Windows.exe
