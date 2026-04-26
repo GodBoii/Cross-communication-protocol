@@ -20,6 +20,29 @@ data class DeviceInfo(
     val lastSeen: Long = System.currentTimeMillis()
 )
 
+data class RemoteFactItem(
+    val label: String,
+    val value: String
+)
+
+data class RemoteEntryItem(
+    val name: String,
+    val subtitle: String
+)
+
+data class RemotePeerPanel(
+    val title: String,
+    val subtitle: String,
+    val battery: String,
+    val storage: String,
+    val notificationAccess: String,
+    val galleryAccess: String,
+    val settings: List<RemoteFactItem>,
+    val gallery: List<RemoteEntryItem>,
+    val files: List<RemoteEntryItem>,
+    val notifications: List<RemoteEntryItem>
+)
+
 fun sha256Hex(bytes: ByteArray): String {
     val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
     return digest.joinToString("") { "%02x".format(it) }
@@ -46,4 +69,3 @@ fun ccpDiscovery(sender: JSONObject): JSONObject {
         .put("capabilities", JSONArray(listOf("pairing", "file.transfer", "foreground.service")))
         .put("timestamp", System.currentTimeMillis() / 1000)
 }
-

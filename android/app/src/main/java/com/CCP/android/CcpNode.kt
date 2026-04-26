@@ -40,13 +40,16 @@ class CcpNode(private val context: Context) {
     private val _snapshot = MutableStateFlow(
         deviceData.localSnapshot(
             notificationAccessEnabled = NotificationCache.hasAccess(context),
-            galleryAccessEnabled = true
+            galleryAccessEnabled = deviceData.hasGalleryAccess()
         )
     )
     val snapshot: StateFlow<LocalDeviceSnapshot> = _snapshot
 
     private val _recentReceived = MutableStateFlow(deviceData.recentReceived())
     val recentReceived: StateFlow<org.json.JSONArray> = _recentReceived
+
+    private val _remotePanel = MutableStateFlow<RemotePeerPanel?>(null)
+    val remotePanel: StateFlow<RemotePeerPanel?> = _remotePanel
 
     fun start() {
         if (running) return
@@ -136,6 +139,32 @@ class CcpNode(private val context: Context) {
                 val complete = JSONObject(reader.readLine())
                 log(if (complete.getJSONObject("payload").optBoolean("ok")) "Sent and verified $fileName" else "Receiver verification failed for $fileName")
             }
+        }
+    }
+
+    fun inspectPeer(peer: DeviceInfo) {
+        scope.launch {
+            if (!peer.trusted) {
+                log("Pair with ${peer.deviceName} before loading its panel.")
+                return@launch
+            }
+            val snapshot = sendSingle(peer, ccpEnvelope("device.snapshot.request", store.sender(), JSONObject()))
+            val gallery = sendSingle(peer, ccpEnvelope("gallery.list.request", store.sender(), JSONObject()))
+            val files = sendSingle(peer, ccpEnvelope("files.list.request", store.sender(), JSONObject()))
+            val notifications = sendSingle(peer, ccpEnvelope("notifications.list.request", store.sender(), JSONObject()))
+            _remotePanel.value = RemotePeerPanel(
+                title = snapshot?.optJSONObject("payload")?.optString("device_title") ?: peer.deviceName,
+                subtitle = snapshot?.optJSONObject("payload")?.optString("device_subtitle") ?: peer.platform,
+                battery = snapshot?.optJSONObject("payload")?.optString("battery") ?: "Unknown",
+                storage = snapshot?.optJSONObject("payload")?.optString("storage") ?: "Unknown",
+                notificationAccess = snapshot?.optJSONObject("payload")?.optString("notification_access") ?: "Unknown",
+                galleryAccess = snapshot?.optJSONObject("payload")?.optString("gallery_access") ?: "Unknown",
+                settings = parseFacts(snapshot?.optJSONObject("payload")?.optJSONArray("settings")),
+                gallery = parseEntries(gallery?.optJSONObject("payload")?.optJSONArray("items"), "Gallery"),
+                files = parseEntries(files?.optJSONObject("payload")?.optJSONArray("items"), "Files"),
+                notifications = parseNotifications(notifications?.optJSONObject("payload"))
+            )
+            log("Loaded panel for ${peer.deviceName}")
         }
     }
 
@@ -250,7 +279,7 @@ class CcpNode(private val context: Context) {
                     "device.snapshot.request" -> {
                         write(writer, ccpEnvelope("device.snapshot.response", store.sender(), deviceData.buildRemoteSnapshotPayload(
                             notificationAccessEnabled = NotificationCache.hasAccess(context),
-                            galleryAccessEnabled = true
+                            galleryAccessEnabled = deviceData.hasGalleryAccess()
                         )))
                     }
                     "gallery.list.request" -> {
@@ -316,8 +345,38 @@ class CcpNode(private val context: Context) {
     fun refreshLocalData() {
         _snapshot.value = deviceData.localSnapshot(
             notificationAccessEnabled = NotificationCache.hasAccess(context),
-            galleryAccessEnabled = true
+            galleryAccessEnabled = deviceData.hasGalleryAccess()
         )
         _recentReceived.value = deviceData.recentReceived()
+    }
+
+    private fun parseFacts(array: org.json.JSONArray?): List<RemoteFactItem> {
+        if (array == null) return emptyList()
+        val list = ArrayList<RemoteFactItem>(array.length())
+        for (index in 0 until array.length()) {
+            val item = array.getJSONObject(index)
+            list.add(RemoteFactItem(item.optString("label"), item.optString("value")))
+        }
+        return list
+    }
+
+    private fun parseEntries(array: org.json.JSONArray?, fallback: String): List<RemoteEntryItem> {
+        if (array == null) return emptyList()
+        val list = ArrayList<RemoteEntryItem>(array.length())
+        for (index in 0 until array.length()) {
+            val item = array.getJSONObject(index)
+            list.add(RemoteEntryItem(item.optString("name", fallback), item.optString("location", item.optString("text", fallback))))
+        }
+        return list
+    }
+
+    private fun parseNotifications(payload: JSONObject?): List<RemoteEntryItem> {
+        val array = payload?.optJSONArray("items") ?: return emptyList()
+        val list = ArrayList<RemoteEntryItem>(array.length())
+        for (index in 0 until array.length()) {
+            val item = array.getJSONObject(index)
+            list.add(RemoteEntryItem(item.optString("title", "Notification"), item.optString("text", "")))
+        }
+        return list
     }
 }
