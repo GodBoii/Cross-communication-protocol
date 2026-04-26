@@ -2,6 +2,7 @@ package com.ccp.android
 
 import android.app.Notification
 import android.app.NotificationManager
+import android.content.pm.PackageManager
 import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
@@ -15,6 +16,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.text.format.Formatter
 import android.webkit.MimeTypeMap
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -98,6 +100,14 @@ class DeviceDataRepository(private val context: Context) {
                 "Device name" to (Build.MODEL ?: "Android")
             )
         )
+    }
+
+    fun hasGalleryAccess(): Boolean {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     fun buildRemoteSnapshotPayload(notificationAccessEnabled: Boolean, galleryAccessEnabled: Boolean): JSONObject {
@@ -216,7 +226,8 @@ class DeviceDataRepository(private val context: Context) {
     }
 
     private fun isBluetoothEnabled(): Boolean {
-        val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+        val adapter = manager?.adapter
         return adapter?.isEnabled == true
     }
 
@@ -233,4 +244,3 @@ class DeviceDataRepository(private val context: Context) {
 
 private fun Cursor.string(column: String): String = getString(getColumnIndexOrThrow(column))
 private fun Cursor.long(column: String): Long = getLong(getColumnIndexOrThrow(column))
-
