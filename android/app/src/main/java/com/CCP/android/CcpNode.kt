@@ -497,41 +497,81 @@ class CcpNode(private val context: Context) {
     /** Handle a message received from the Convex cloud relay. */
     private fun handleConvexMessage(msg: ConvexMessage) {
         val senderShort = msg.senderId.take(8)
+        val requestId = msg.payload.optString("request_id", "")
+
         when (msg.msgType) {
+            "device.snapshot.request" -> {
+                log("[Cloud] Snapshot request from $senderShort…")
+                scope.launch {
+                    val response = deviceData.buildRemoteSnapshotPayload(
+                        notificationAccessEnabled = NotificationCache.hasAccess(context),
+                        galleryAccessEnabled = deviceData.hasGalleryAccess()
+                    )
+                    if (requestId.isNotBlank()) response.put("request_id", requestId)
+                    convexBridge.pushMessage(msg.senderId, "device.snapshot.response", response)
+                }
+            }
+
+            "gallery.list.request" -> {
+                log("[Cloud] Gallery request from $senderShort…")
+                scope.launch {
+                    val response = deviceData.buildGalleryPayload()
+                    if (requestId.isNotBlank()) response.put("request_id", requestId)
+                    convexBridge.pushMessage(msg.senderId, "gallery.list.response", response)
+                }
+            }
+
+            "files.list.request" -> {
+                log("[Cloud] Files request from $senderShort…")
+                scope.launch {
+                    val response = deviceData.buildFilesPayload()
+                    if (requestId.isNotBlank()) response.put("request_id", requestId)
+                    convexBridge.pushMessage(msg.senderId, "files.list.response", response)
+                }
+            }
+
+            "notifications.list.request" -> {
+                log("[Cloud] Notifications request from $senderShort…")
+                scope.launch {
+                    val response = deviceData.buildNotificationsPayload()
+                    if (requestId.isNotBlank()) response.put("request_id", requestId)
+                    convexBridge.pushMessage(msg.senderId, "notifications.list.response", response)
+                }
+            }
+
             "remote.action.request" -> {
                 val action = msg.payload.optString("action")
                 val args = msg.payload.optJSONObject("args") ?: JSONObject()
                 log("[Cloud] Remote action from $senderShort…: $action")
                 scope.launch {
                     val result = performRemoteAction(action, args)
-                    // Try to respond via cloud relay
-                    val peer = peersById[msg.senderId]
-                    if (peer != null) {
-                        convexBridge.pushMessage(
-                            msg.senderId,
-                            "remote.action.response",
-                            JSONObject()
-                                .put("ok", result.first)
-                                .put("message", result.second)
-                                .put("action", action)
-                        )
-                    }
+                    val response = JSONObject()
+                        .put("ok", result.first)
+                        .put("message", result.second)
+                        .put("action", action)
+                    if (requestId.isNotBlank()) response.put("request_id", requestId)
+                    convexBridge.pushMessage(msg.senderId, "remote.action.response", response)
                 }
             }
+
             "file.offer" -> {
                 val filename = msg.payload.optString("filename", "?")
                 log("[Cloud] File offer from $senderShort…: $filename")
             }
+
             "clipboard.sync" -> {
                 log("[Cloud] Clipboard sync from $senderShort…")
             }
+
             "notification.push" -> {
                 val title = msg.payload.optString("title", "Notification")
                 log("[Cloud] Notification from $senderShort…: $title")
             }
+
             "heartbeat" -> {
                 log("[Cloud] Heartbeat from $senderShort…")
             }
+
             else -> {
                 log("[Cloud] ${msg.msgType} from $senderShort…")
             }

@@ -274,6 +274,7 @@ fun CcpScreen(
             NearbyDevicesCard(
                 peers = peers,
                 preferredTransports = preferredTransports,
+                cloudStatus = cloudStatus,
                 onPair = { node.pair(it) },
                 onInspect = {
                     inspectedPeerId = it.deviceId
@@ -391,6 +392,7 @@ fun PermissionsCard(
 fun NearbyDevicesCard(
     peers: List<DeviceInfo>,
     preferredTransports: Map<String, String>,
+    cloudStatus: String,
     onPair: (DeviceInfo) -> Unit,
     onInspect: (DeviceInfo) -> Unit,
     onSend: (DeviceInfo) -> Unit,
@@ -398,7 +400,38 @@ fun NearbyDevicesCard(
 ) {
     ObsidianCard {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Nearby devices", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Nearby devices", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+                // Long Distance indicator
+                val isRelayReady = cloudStatus.contains("✓") || cloudStatus.contains("ready")
+                Box(
+                    Modifier
+                        .background(
+                            if (isRelayReady) Color(0xFF22c55e).copy(alpha = 0.12f) else AccentBrand.copy(alpha = 0.12f),
+                            RoundedCornerShape(50)
+                        )
+                        .border(
+                            1.dp,
+                            if (isRelayReady) Color(0xFF22c55e).copy(alpha = 0.35f) else AccentBrand.copy(alpha = 0.35f),
+                            RoundedCornerShape(50)
+                        )
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text("☁", fontSize = 12.sp, color = if (isRelayReady) Color(0xFF22c55e) else AccentBrand)
+                        Text(
+                            if (isRelayReady) "Long Distance" else "Connecting…",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (isRelayReady) Color(0xFF22c55e) else AccentBrand
+                        )
+                    }
+                }
+            }
             if (peers.isEmpty()) {
                 Text("Scanning on local Wi-Fi…", color = TextMut, fontSize = 13.sp)
             } else {
