@@ -12,6 +12,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, Button, Frame, Label, Listbox, StringVar, Tk, filedialog, messagebox
 
+# ── Convex cloud bridge (no extra deps required) ──────────────────────────────
+try:
+    from ccp_convex import ConvexBridge
+    _CONVEX_AVAILABLE = True
+except ImportError:
+    _CONVEX_AVAILABLE = False
+    ConvexBridge = None  # type: ignore
+
+# Set your Convex deployment URL here.
+# Get it from: https://dashboard.convex.dev → your project → Settings → URL
+CONVEX_URL = "https://small-cat-699.convex.cloud"
+
 PROTOCOL = "ccp.v0"
 UDP_PORT = 47827
 TCP_PORT = 47828
@@ -113,6 +125,18 @@ class CcpBackend:
         self.running = threading.Event()
         self.running.set()
 
+        # ── Convex cloud bridge ────────────────────────────────────────────
+        self.convex: "ConvexBridge | None" = None
+        if _CONVEX_AVAILABLE and CONVEX_URL:
+            self.convex = ConvexBridge(
+                convex_url=CONVEX_URL,
+                device_id=self.config.device_id,
+                device_name=self.config.device_name,
+                platform="windows",
+                on_message=self._handle_cloud_message,
+            )
+            self.convex.set_logger(lambda msg: self.log(msg))
+
     def sender(self):
         return {
             "device_id": self.config.device_id,
@@ -142,10 +166,20 @@ class CcpBackend:
         threading.Thread(target=self._discovery_broadcast_loop, daemon=True).start()
         threading.Thread(target=self._discovery_listen_loop, daemon=True).start()
         threading.Thread(target=self._tcp_server_loop, daemon=True).start()
+        # Start Convex cloud bridge
+        if self.convex:
+            caps = ["pairing", "file.transfer", "remote.action", "device.snapshot"]
+            threading.Thread(
+                target=self.convex.start,
+                kwargs={"app_version": "0.2.0", "capabilities": caps},
+                daemon=True,
+            ).start()
         self.log(f"Started as {self.config.device_name}")
 
     def stop(self):
         self.running.clear()
+        if self.convex:
+            self.convex.stop()
 
     def _discovery_packet(self):
         return {
@@ -254,8 +288,47 @@ class CcpBackend:
                 peer.host = host
             self.events.put(("peers", list(self.peers.values())))
             self.log(f"Trusted {sender.get('device_name')}")
+            # ── Cloud key exchange ──────────────────────────────────────────
+            # After pairing over WiFi, perform ECDH key exchange and store
+            # the encrypted session key in Convex so both devices can
+            # communicate via cloud relay even when off the same network.
+            peer_pub_key = payload.get("public_key", "")
+            if self.convex and peer_pub_key and peer_pub_key != "reserved-for-v1":
+                peer_id = sender["device_id"]
+                try:
+                    fingerprint = self.convex.complete_key_exchange(
+                        peer_id, peer_pub_key, paired_via="wifi"
+                    )
+                    self.log(f"Cloud key exchanged (fingerprint: {fingerprint[:12]}…)")
+                    self.events.put(("cloud_status", f"Paired & cloud-ready: {sender.get('device_name')}"))
+                except Exception as e:
+                    self.log(f"Key exchange error: {e}")
+            elif self.convex:
+                # Peer running older client without public key in pair packet;
+                # fetch the key from the cloud registry instead.
+                peer_id = sender["device_id"]
+                threading.Thread(
+                    target=self._deferred_key_exchange, args=(peer_id,), daemon=True
+                ).start()
         response = self.envelope("pair.response", {"accepted": accepted, "reason": None if accepted else "rejected"})
         self._write_message(file_obj, response)
+
+    def _deferred_key_exchange(self, peer_id: str) -> None:
+        """Fetch the peer's public key from Convex and complete key exchange."""
+        if not self.convex:
+            return
+        for attempt in range(5):
+            time.sleep(2 ** attempt)  # exponential back-off
+            pub_key = self.convex.get_peer_public_key(peer_id)
+            if pub_key:
+                try:
+                    fp = self.convex.complete_key_exchange(peer_id, pub_key, "wifi")
+                    self.log(f"Deferred key exchange OK (fp: {fp[:12]}…)")
+                    self.events.put(("cloud_status", f"Cloud relay ready for {peer_id[:8]}…"))
+                    return
+                except Exception as e:
+                    self.log(f"Deferred key exchange attempt {attempt+1} failed: {e}")
+        self.log(f"Key exchange failed for {peer_id[:8]}… after 5 attempts")
 
     def _handle_file_offer(self, file_obj, sender, payload):
         if not self.config.is_trusted(sender.get("device_id")):
@@ -312,12 +385,24 @@ class CcpBackend:
     def pair(self, peer):
         code = f"{random.randint(0, 999999):06d}"
         self.log(f"Pair request sent to {peer.device_name}. Code: {code}")
-        response = self._send_single(peer, self.envelope("pair.request", {"pair_code": code, "public_key": "reserved-for-v1"}))
+        # Include our public key so the peer can complete key exchange immediately
+        pub_key_b64 = self.convex._public_key_b64 if self.convex else "reserved-for-v1"
+        response = self._send_single(peer, self.envelope("pair.request", {
+            "pair_code": code,
+            "public_key": pub_key_b64,
+        }))
         if response and response.get("payload", {}).get("accepted"):
             self.config.trust({"device_id": peer.device_id, "device_name": peer.device_name, "platform": peer.platform})
             peer.trusted = True
             self.events.put(("peers", list(self.peers.values())))
             self.log(f"Paired with {peer.device_name}")
+            # Start cloud key exchange
+            if self.convex:
+                threading.Thread(
+                    target=self._deferred_key_exchange,
+                    args=(peer.device_id,),
+                    daemon=True,
+                ).start()
         else:
             self.log(f"Pairing rejected by {peer.device_name}")
 
@@ -375,7 +460,55 @@ class CcpBackend:
                 else:
                     self.log(f"Sent {file_path.name}, but receiver verification failed.")
         except Exception as exc:
-            self.log(f"Send failed: {exc}")
+            self.log(f"Local send failed: {exc}")
+            # ── Cloud relay fallback ────────────────────────────────────────
+            # If the local TCP connection fails and we have a cloud session,
+            # push the file offer metadata via Convex so the peer can request
+            # a retry or schedule a transfer.
+            if self.convex and peer.trusted:
+                file_path = Path(path)
+                size = file_path.stat().st_size if file_path.exists() else 0
+                pushed = self.convex.push_message(
+                    peer.device_id,
+                    "file.offer",
+                    {
+                        "filename": file_path.name,
+                        "size": size,
+                        "message": "File transfer queued via cloud relay — accept when online",
+                    }
+                )
+                if pushed:
+                    self.log(f"File offer queued in cloud relay for {peer.device_name}")
+
+
+    def _handle_cloud_message(self, msg: dict) -> None:
+        """Called by the Convex bridge when a cloud relay message arrives."""
+        msg_type = msg.get("msg_type", "")
+        payload = msg.get("payload", {})
+        sender_id = msg.get("sender_id", "")[:12]
+
+        if msg_type == "remote.action.request":
+            action = payload.get("action", "")
+            self.log(f"[Cloud] Remote action from {sender_id}…: {action}")
+            self.events.put(("cloud_msg", f"Remote action: {action} (from {sender_id}…)"))
+        elif msg_type == "file.offer":
+            fname = payload.get("filename", "?")
+            self.log(f"[Cloud] File offer from {sender_id}…: {fname}")
+            self.events.put(("cloud_msg", f"File offer: {fname} (from {sender_id}…)"))
+        elif msg_type == "clipboard.sync":
+            self.log(f"[Cloud] Clipboard sync from {sender_id}…")
+        elif msg_type == "notification.push":
+            title = payload.get("title", "Notification")
+            self.log(f"[Cloud] Notification from {sender_id}…: {title}")
+        else:
+            self.log(f"[Cloud] {msg_type} from {sender_id}…")
+
+    def send_cloud_message(self, peer, msg_type: str, payload: dict) -> bool:
+        """Push any CCP message to a peer via cloud relay."""
+        if not self.convex:
+            self.log("Cloud relay not configured")
+            return False
+        return self.convex.push_message(peer.device_id, msg_type, payload)
 
 
 class CcpApp:
@@ -407,8 +540,16 @@ class CcpApp:
         Button(left, text="Send file", command=self._send_selected).pack(fill=BOTH, pady=(8, 0))
 
         Label(right, text="Activity").pack(anchor="w")
-        self.log_list = Listbox(right, height=18)
+        self.log_list = Listbox(right, height=15)
         self.log_list.pack(fill=BOTH, expand=True)
+
+        # Cloud relay status
+        cloud_frame = Frame(right)
+        cloud_frame.pack(fill=BOTH, pady=(8, 0))
+        self.cloud_status_var = StringVar(value="☁ Cloud: Connecting…")
+        Label(cloud_frame, textvariable=self.cloud_status_var, fg="#60a5fa").pack(anchor="w")
+        Button(cloud_frame, text="Send via Cloud", command=self._cloud_send_selected).pack(fill=BOTH, pady=(4, 0))
+
         Label(self.root, textvariable=self.status).pack(fill=BOTH, padx=12, pady=(0, 12))
 
     def _selected_peer(self):
@@ -431,6 +572,24 @@ class CcpApp:
         if path:
             self.backend.send_file(peer, path)
 
+    def _cloud_send_selected(self):
+        """Send a cloud relay test command to the selected peer."""
+        peer = self._selected_peer()
+        if not peer:
+            return
+        if not peer.trusted:
+            messagebox.showinfo("CCP", "Pair with the device before using cloud relay.")
+            return
+        ok = self.backend.send_cloud_message(
+            peer,
+            "remote.action.request",
+            {"action": "heartbeat", "args": {}, "from": self.backend.config.device_name}
+        )
+        if ok:
+            messagebox.showinfo("CCP", f"Cloud message sent to {peer.device_name}!")
+        else:
+            messagebox.showerror("CCP", f"Cloud send failed. Ensure devices are paired and both are registered.")
+
     def _pump_events(self):
         while True:
             try:
@@ -451,6 +610,11 @@ class CcpApp:
             elif kind == "confirm":
                 title, prompt, replies = payload
                 replies.put(messagebox.askyesno(title, prompt))
+            elif kind == "cloud_status":
+                self.cloud_status_var.set(f"☁ {payload}")
+            elif kind == "cloud_msg":
+                self.log_list.insert(END, f"[Cloud] {payload}")
+                self.log_list.see(END)
         self.root.after(200, self._pump_events)
 
     def _close(self):
