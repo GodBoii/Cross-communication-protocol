@@ -9,6 +9,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Windows;
 
 namespace CCP.Windows.Services;
@@ -30,11 +31,22 @@ public sealed class CcpNode : IDisposable
     private readonly Func<string, string, bool> _confirm;
     private readonly CancellationTokenSource _stop = new();
 
+    // ── Cloud mode state ──────────────────────────────────────────────────
+    private bool _cloudModeEnabled;
+    public bool IsCloudModeEnabled => _cloudModeEnabled;
+
+    // ── Convex cloud bridge ────────────────────────────────────────────────
+    public ConvexService Convex { get; }
+
     public CcpNode(Action<IReadOnlyList<PeerView>> onPeers, Action<string> onEvent, Func<string, string, bool> confirm)
     {
         _onPeers = onPeers;
         _onEvent = onEvent;
         _confirm = confirm;
+
+        Convex = new ConvexService(_config.DeviceId, _config.DeviceName, _config.PrivateKey);
+        Convex.SetLogger(msg => _onEvent(msg));
+        Convex.OnMessageReceived += HandleCloudMessage;
     }
 
     public Task StartAsync()
@@ -42,6 +54,7 @@ public sealed class CcpNode : IDisposable
         _ = Task.Run(() => BroadcastLoopAsync(_stop.Token));
         _ = Task.Run(() => ListenDiscoveryAsync(_stop.Token));
         _ = Task.Run(() => ListenTcpAsync(_stop.Token));
+        Convex.Start();
         _onEvent($"Native Windows node started as {_config.DeviceName}");
         return Task.CompletedTask;
     }
@@ -59,18 +72,37 @@ public sealed class CcpNode : IDisposable
         var response = await SendSingleAsync(peer, Envelope("pair.request", new()
         {
             ["pair_code"] = code,
-            ["public_key"] = "reserved-for-v1"
+            // Include our public key so the peer can complete ECDH immediately
+            ["public_key"] = Convex.PublicKeyB64,
         }));
         if (response is not null && response.Payload.TryGetValue("accepted", out var accepted) && AsBool(accepted))
         {
             _config.Trust(new SenderInfo(peer.DeviceId, peer.DeviceName, peer.Platform));
             UpsertPeer(peer with { Trusted = true, LastSeen = DateTime.Now });
             _onEvent($"Paired with {peer.DeviceName}");
+            // Trigger cloud key exchange in background
+            _ = Task.Run(() => DeferredKeyExchangeAsync(peer.DeviceId));
         }
         else
         {
             _onEvent($"Pairing rejected by {peer.DeviceName}");
         }
+    }
+
+    private async Task DeferredKeyExchangeAsync(string peerDeviceId)
+    {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            await Task.Delay(1000 * (1 << attempt));
+            var pubKey = await Convex.GetPeerPublicKeyAsync(peerDeviceId);
+            if (pubKey is not null)
+            {
+                var fp = await Convex.CompleteKeyExchangeAsync(peerDeviceId, pubKey, "wifi");
+                _onEvent($"Cloud key exchange OK for {peerDeviceId[..8]}… (fp: {fp[..12]}…)");
+                return;
+            }
+        }
+        _onEvent($"Key exchange failed for {peerDeviceId[..8]}… after 5 attempts");
     }
 
     public async Task SendFileAsync(PeerView peer, string path)
@@ -146,6 +178,12 @@ public sealed class CcpNode : IDisposable
             return RemoteDevicePanel.Empty(peer.DeviceName, peer.Platform);
         }
 
+        // Cloud peers use cloud relay, local peers use direct TCP
+        if (peer.IsCloudPeer)
+        {
+            return await GetPeerPanelViaCloudAsync(peer);
+        }
+
         var snapshot = await RequestPayloadAsync(peer, "device.snapshot.request");
         var gallery = await RequestPayloadAsync(peer, "gallery.list.request");
         var files = await RequestPayloadAsync(peer, "files.list.request");
@@ -162,6 +200,111 @@ public sealed class CcpNode : IDisposable
             Gallery: ParseItems(gallery?.GetValueOrDefault("items"), "gallery"),
             Files: ParseItems(files?.GetValueOrDefault("items"), "file"),
             Notifications: ParseNotifications(notifications));
+    }
+
+    // ── Cloud-based operations ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Fetch the device panel data entirely through the Convex cloud relay.
+    /// Used when the peer is only reachable via Long Distance mode.
+    /// </summary>
+    private async Task<RemoteDevicePanel> GetPeerPanelViaCloudAsync(PeerView peer)
+    {
+        _onEvent($"☁ Loading panel for {peer.DeviceName} via cloud relay…");
+
+        var snapshot = await Convex.SendCloudRequestAsync(peer.DeviceId, "device.snapshot.request", timeoutMs: 20_000);
+        var gallery = await Convex.SendCloudRequestAsync(peer.DeviceId, "gallery.list.request", timeoutMs: 20_000);
+        var files = await Convex.SendCloudRequestAsync(peer.DeviceId, "files.list.request", timeoutMs: 20_000);
+        var notifications = await Convex.SendCloudRequestAsync(peer.DeviceId, "notifications.list.request", timeoutMs: 20_000);
+
+        return new RemoteDevicePanel(
+            Title: snapshot?["device_title"]?.GetValue<string>() ?? peer.DeviceName,
+            Subtitle: snapshot?["device_subtitle"]?.GetValue<string>() ?? peer.Platform,
+            Battery: snapshot?["battery"]?.GetValue<string>() ?? "Unknown",
+            Storage: snapshot?["storage"]?.GetValue<string>() ?? "Unknown",
+            NotificationAccess: snapshot?["notification_access"]?.GetValue<string>() ?? "Unknown",
+            GalleryAccess: snapshot?["gallery_access"]?.GetValue<string>() ?? "Unknown",
+            Settings: ParseJsonNodeFacts(snapshot?["settings"]),
+            Gallery: ParseJsonNodeItems(gallery?["items"], "gallery"),
+            Files: ParseJsonNodeItems(files?["items"], "file"),
+            Notifications: ParseJsonNodeNotifications(notifications));
+    }
+
+    /// <summary>
+    /// Toggle Long Distance (cloud) mode. When enabled, loads all paired peers
+    /// from Convex and adds them to the peer list as cloud peers.
+    /// </summary>
+    public async Task ToggleCloudModeAsync()
+    {
+        _cloudModeEnabled = !_cloudModeEnabled;
+
+        if (_cloudModeEnabled)
+        {
+            _onEvent("☁ Long Distance mode enabled — loading cloud peers…");
+            await LoadCloudPeersAsync();
+        }
+        else
+        {
+            _onEvent("☁ Long Distance mode disabled");
+            // Remove cloud peers from the peer list
+            foreach (var entry in _peers.ToArray())
+            {
+                if (entry.Value.IsCloudPeer && _peers.TryRemove(entry.Key, out _)) { }
+            }
+            PublishPeers();
+        }
+    }
+
+    /// <summary>
+    /// Load all paired peers from Convex sessions, check their online status,
+    /// and add them to the peer list as cloud peers.
+    /// </summary>
+    public async Task LoadCloudPeersAsync()
+    {
+        try
+        {
+            var pairedPeers = await Convex.ListPairedPeersAsync();
+            var loaded = 0;
+
+            foreach (var (deviceId, fingerprint, pairedVia, online) in pairedPeers)
+            {
+                // Skip if already visible as a local peer
+                if (_peers.TryGetValue(deviceId, out var existing) && !existing.IsCloudPeer)
+                    continue;
+
+                // Fetch device info from Convex
+                var info = await Convex.GetPeerDeviceInfoAsync(deviceId);
+                var name = info?.Name ?? $"Cloud device {deviceId[..8]}…";
+                var platform = info?.Platform ?? "unknown";
+
+                // Ensure we have the session key loaded
+                await Convex.LoadSessionFromCloudAsync(deviceId);
+
+                UpsertPeer(new PeerView
+                {
+                    DeviceId = deviceId,
+                    DeviceName = name,
+                    Platform = platform,
+                    Address = IPAddress.Loopback,  // dummy — not used for cloud peers
+                    TcpPort = 0,
+                    Trusted = true,  // paired peers are trusted
+                    LastSeen = DateTime.Now,
+                    AvailableTransports = ["cloud"],
+                    Routes = [],
+                    IsCloudPeer = true,
+                    CloudOnline = online,
+                });
+                loaded++;
+            }
+
+            _onEvent(loaded > 0
+                ? $"☁ Found {loaded} cloud peer(s)"
+                : "☁ No paired peers found in cloud");
+        }
+        catch (Exception ex)
+        {
+            _onEvent($"☁ Failed to load cloud peers: {ex.Message}");
+        }
     }
 
     public string GetPreferredTransport(string deviceId)
@@ -184,6 +327,12 @@ public sealed class CcpNode : IDisposable
 
     public async Task<bool> RequestRemoteActionAsync(PeerView peer, string action, Dictionary<string, object?>? args = null)
     {
+        // Cloud peers: route through cloud relay
+        if (peer.IsCloudPeer)
+        {
+            return await RequestRemoteActionViaCloudAsync(peer, action, args);
+        }
+
         var payload = new Dictionary<string, object?>
         {
             ["action"] = action,
@@ -202,6 +351,30 @@ public sealed class CcpNode : IDisposable
         _onEvent(ok
             ? $"Remote action completed: {message ?? action}"
             : $"Remote action failed: {message ?? action}");
+        return ok;
+    }
+
+    private async Task<bool> RequestRemoteActionViaCloudAsync(PeerView peer, string action, Dictionary<string, object?>? args = null)
+    {
+        _onEvent($"☁ Sending remote action {action} to {peer.DeviceName} via cloud…");
+        var payload = new JsonObject
+        {
+            ["action"] = action,
+            ["args"] = JsonSerializer.SerializeToNode(args ?? new Dictionary<string, object?>()),
+        };
+
+        var response = await Convex.SendCloudRequestAsync(peer.DeviceId, "remote.action.request", payload, timeoutMs: 20_000);
+        if (response is null)
+        {
+            _onEvent($"☁ No cloud response for remote action {action}");
+            return false;
+        }
+
+        var ok = response["ok"]?.GetValue<bool>() ?? false;
+        var message = response["message"]?.GetValue<string>();
+        _onEvent(ok
+            ? $"☁ Remote action completed: {message ?? action}"
+            : $"☁ Remote action failed: {message ?? action}");
         return ok;
     }
 
@@ -303,7 +476,24 @@ public sealed class CcpNode : IDisposable
                     case "pair.request":
                         var code = AsString(message.Payload.GetValueOrDefault("pair_code")) ?? "??????";
                         var accepted = _confirm("CCP Pairing Request", $"Pair with {message.Sender.DeviceName} ({message.Sender.Platform})?\nPair code: {code}");
-                        if (accepted) _config.Trust(message.Sender);
+                        if (accepted)
+                        {
+                            _config.Trust(message.Sender);
+                            // Key exchange: use public key from pair packet if present
+                            var peerPubKey = AsString(message.Payload.GetValueOrDefault("public_key"));
+                            if (!string.IsNullOrEmpty(peerPubKey) && peerPubKey != "reserved-for-v1")
+                            {
+                                _ = Task.Run(async () =>
+                                {
+                                    var fp = await Convex.CompleteKeyExchangeAsync(message.Sender.DeviceId, peerPubKey, "wifi");
+                                    _onEvent($"Cloud key exchange with {message.Sender.DeviceName} complete (fp: {fp[..12]}…)");
+                                });
+                            }
+                            else
+                            {
+                                _ = Task.Run(() => DeferredKeyExchangeAsync(message.Sender.DeviceId));
+                            }
+                        }
                         await WriteAsync(writer, Envelope("pair.response", new() { ["accepted"] = accepted, ["reason"] = accepted ? null : "rejected" }));
                         _onEvent(accepted ? $"Trusted {message.Sender.DeviceName}" : $"Rejected pair request from {message.Sender.DeviceName}");
                         break;
@@ -876,9 +1066,172 @@ public sealed class CcpNode : IDisposable
         return $"{size:0.#} {units[order]}";
     }
 
+    private void HandleCloudMessage(string senderId, string msgType, JsonObject payload)
+    {
+        var senderShort = senderId[..Math.Min(8, senderId.Length)];
+        var requestId = payload["request_id"]?.GetValue<string>();
+
+        switch (msgType)
+        {
+            case "device.snapshot.request":
+            {
+                _onEvent($"[Cloud] Snapshot request from {senderShort}…");
+                _ = Task.Run(async () =>
+                {
+                    var dict = BuildLocalSnapshotPayload();
+                    var response = JsonNode.Parse(JsonSerializer.Serialize(dict))!.AsObject();
+                    if (requestId is not null) response["request_id"] = requestId;
+                    await Convex.PushMessageAsync(senderId, "device.snapshot.response", response);
+                });
+                break;
+            }
+
+            case "gallery.list.request":
+            {
+                _onEvent($"[Cloud] Gallery request from {senderShort}…");
+                _ = Task.Run(async () =>
+                {
+                    var dict = BuildDirectoryPayload(
+                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures)), "gallery");
+                    var response = JsonNode.Parse(JsonSerializer.Serialize(dict))!.AsObject();
+                    if (requestId is not null) response["request_id"] = requestId;
+                    await Convex.PushMessageAsync(senderId, "gallery.list.response", response);
+                });
+                break;
+            }
+
+            case "files.list.request":
+            {
+                _onEvent($"[Cloud] Files request from {senderShort}…");
+                _ = Task.Run(async () =>
+                {
+                    var dict = BuildDirectoryPayload(
+                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"), "file");
+                    var response = JsonNode.Parse(JsonSerializer.Serialize(dict))!.AsObject();
+                    if (requestId is not null) response["request_id"] = requestId;
+                    await Convex.PushMessageAsync(senderId, "files.list.response", response);
+                });
+                break;
+            }
+
+            case "notifications.list.request":
+            {
+                _onEvent($"[Cloud] Notifications request from {senderShort}…");
+                _ = Task.Run(async () =>
+                {
+                    var dict = new Dictionary<string, object?>
+                    {
+                        ["permission_granted"] = false,
+                        ["items"] = Array.Empty<object>()
+                    };
+                    var response = JsonNode.Parse(JsonSerializer.Serialize(dict))!.AsObject();
+                    if (requestId is not null) response["request_id"] = requestId;
+                    await Convex.PushMessageAsync(senderId, "notifications.list.response", response);
+                });
+                break;
+            }
+
+            case "remote.action.request":
+            {
+                var action = payload["action"]?.GetValue<string>() ?? "";
+                _onEvent($"[Cloud] Remote action from {senderShort}…: {action}");
+                _ = Task.Run(async () =>
+                {
+                    // Windows doesn't fully support remote actions yet,
+                    // but we acknowledge the request properly
+                    var response = new JsonObject
+                    {
+                        ["ok"] = false,
+                        ["message"] = "Remote actions are not fully implemented on Windows yet.",
+                        ["action"] = action,
+                    };
+                    if (requestId is not null) response["request_id"] = requestId;
+                    await Convex.PushMessageAsync(senderId, "remote.action.response", response);
+                });
+                break;
+            }
+
+            case "file.offer":
+            {
+                var filename = payload["filename"]?.GetValue<string>() ?? "?";
+                _onEvent($"[Cloud] File offer from {senderShort}…: {filename}");
+                break;
+            }
+
+            case "clipboard.sync":
+            {
+                _onEvent($"[Cloud] Clipboard sync from {senderShort}…");
+                break;
+            }
+
+            case "notification.push":
+            {
+                var title = payload["title"]?.GetValue<string>() ?? "Notification";
+                _onEvent($"[Cloud] Notification from {senderShort}…: {title}");
+                break;
+            }
+
+            default:
+                _onEvent($"[Cloud] {msgType} from {senderShort}…");
+                break;
+        }
+    }
+
+    // ── JsonNode-based parsers for cloud responses ─────────────────────────
+
+    private static IReadOnlyList<RemoteFactView> ParseJsonNodeFacts(JsonNode? node)
+    {
+        var result = new List<RemoteFactView>();
+        if (node is not JsonArray array) return result;
+        foreach (var item in array)
+        {
+            if (item is not JsonObject obj) continue;
+            result.Add(new RemoteFactView(
+                obj["label"]?.GetValue<string>() ?? "Setting",
+                obj["value"]?.GetValue<string>() ?? "Unknown"));
+        }
+        return result;
+    }
+
+    private static IReadOnlyList<RemoteContentItem> ParseJsonNodeItems(JsonNode? node, string fallbackType)
+    {
+        var result = new List<RemoteContentItem>();
+        if (node is not JsonArray array) return result;
+        foreach (var item in array)
+        {
+            if (item is not JsonObject obj) continue;
+            var subtitle = obj["location"]?.GetValue<string>()
+                ?? obj["mime_type"]?.GetValue<string>()
+                ?? obj["size"]?.ToString()
+                ?? fallbackType;
+            result.Add(new RemoteContentItem(
+                obj["name"]?.GetValue<string>() ?? "Untitled",
+                subtitle,
+                obj["type"]?.GetValue<string>() ?? fallbackType));
+        }
+        return result;
+    }
+
+    private static IReadOnlyList<RemoteContentItem> ParseJsonNodeNotifications(JsonObject? payload)
+    {
+        var result = new List<RemoteContentItem>();
+        if (payload?["items"] is not JsonArray array) return result;
+        foreach (var item in array)
+        {
+            if (item is not JsonObject obj) continue;
+            result.Add(new RemoteContentItem(
+                obj["title"]?.GetValue<string>() ?? "Notification",
+                obj["text"]?.GetValue<string>() ?? "",
+                "notification"));
+        }
+        return result;
+    }
+
     public void Dispose()
     {
         _stop.Cancel();
         _stop.Dispose();
+        _ = Convex.StopAsync();
+        Convex.Dispose();
     }
 }
