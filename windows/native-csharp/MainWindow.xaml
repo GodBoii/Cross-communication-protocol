@@ -119,7 +119,7 @@
                         <TextBlock Text="Pair once, then browse from desktop." Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,4,0,0"/>
                     </StackPanel>
 
-                    <ListBox Grid.Row="1" ItemsSource="{Binding Peers}" SelectedItem="{Binding SelectedPeer}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                    <ListBox Grid.Row="1" ItemsSource="{Binding Peers}" SelectedItem="{Binding SelectedPeer}" SelectedValue="{Binding SelectedPeerId, Mode=TwoWay}" SelectedValuePath="DeviceId" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate DataType="{x:Type models:PeerView}">
                                 <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R10}" Margin="0,0,0,8" Padding="10">
@@ -190,6 +190,7 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
 
@@ -206,8 +207,35 @@
                         <Button Grid.Column="1" Content="Reload" Command="{Binding RefreshPanelCommand}" Padding="10,5" FontSize="11"/>
                     </Grid>
 
+                    <Border Grid.Row="1" Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Padding="12" Margin="0,0,0,12">
+                        <StackPanel>
+                            <TextBlock Text="Connection pipeline" Foreground="{StaticResource TextMuted}" FontSize="10"/>
+                            <Grid Margin="0,6,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="170"/>
+                                    <ColumnDefinition Width="10"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <ComboBox ItemsSource="{Binding TransportOptions}" SelectedItem="{Binding SelectedTransportOption}" Padding="8,4"/>
+                                <TextBox Grid.Column="2" Text="{Binding DialNumber, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
+                                <Button Grid.Column="3" Content="Dial" Command="{Binding DialCommand}" Padding="10,5" Margin="0,0,6,0"/>
+                                <Button Grid.Column="4" Content="Answer" Command="{Binding AnswerCallCommand}" Padding="10,5" Margin="0,0,6,0"/>
+                                <Button Grid.Column="5" Content="Wi-Fi" Command="{Binding OpenWifiSettingsCommand}" Padding="10,5" Margin="0,0,6,0"/>
+                                <Button Grid.Column="6" Content="Bluetooth" Command="{Binding OpenBluetoothSettingsCommand}" Padding="10,5"/>
+                            </Grid>
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                <Button Content="Location" Command="{Binding OpenLocationSettingsCommand}" Padding="10,5" Margin="0,0,6,0"/>
+                                <Button Content="Notifications" Command="{Binding OpenNotificationSettingsCommand}" Padding="10,5"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
                     <!-- Unified Stats Row -->
-                    <Border Grid.Row="1" Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Margin="0,0,0,14">
+                    <Border Grid.Row="2" Background="{StaticResource Surface2}" BorderBrush="{StaticResource BorderSubtle}" BorderThickness="1" CornerRadius="{StaticResource R8}" Margin="0,0,0,14">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
@@ -241,7 +269,7 @@
                     </Border>
 
                     <!-- Tabs -->
-                    <TabControl Grid.Row="2" Style="{StaticResource TabCtrl}">
+                    <TabControl Grid.Row="3" Style="{StaticResource TabCtrl}">
                         <TabItem Header="Overview" Style="{StaticResource TabBtn}">
                             <ScrollViewer VerticalScrollBarVisibility="Auto">
                                 <ItemsControl ItemsSource="{Binding DeviceSettings}">

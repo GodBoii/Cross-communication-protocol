@@ -3,6 +3,7 @@ using CCP.Windows.Services;
 using Microsoft.Win32;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Input;
@@ -13,6 +14,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 {
     private readonly CcpNode _node;
     private PeerView? _selectedPeer;
+    private CancellationTokenSource? _panelLoopCts;
     private bool _isLoadingPanel;
     private string _selectedPeerLabel = "No device selected";
     private string _panelTitle = "Choose a trusted device";
@@ -21,6 +23,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private string _storageText = "Unknown";
     private string _notificationAccessText = "Unknown";
     private string _galleryAccessText = "Unknown";
+    private string? _selectedPeerId;
+    private string _selectedTransportOption = "auto";
+    private string _dialNumber = "";
 
     public ObservableCollection<PeerView> Peers { get; } = [];
     public ObservableCollection<string> Events { get; } = [];
@@ -28,12 +33,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public ObservableCollection<RemoteContentItem> GalleryItems { get; } = [];
     public ObservableCollection<RemoteContentItem> FileItems { get; } = [];
     public ObservableCollection<RemoteContentItem> NotificationItems { get; } = [];
+    public ObservableCollection<string> TransportOptions { get; } = ["auto"];
 
     public ICommand PairCommand { get; }
     public ICommand InspectCommand { get; }
     public ICommand SendFileCommand { get; }
     public ICommand RefreshCommand { get; }
     public ICommand RefreshPanelCommand { get; }
+    public ICommand DialCommand { get; }
+    public ICommand AnswerCallCommand { get; }
+    public ICommand OpenWifiSettingsCommand { get; }
+    public ICommand OpenBluetoothSettingsCommand { get; }
+    public ICommand OpenLocationSettingsCommand { get; }
+    public ICommand OpenNotificationSettingsCommand { get; }
 
     public string LocalStatus => "Bridge online";
     public string FooterStatus { get; private set; } = "Starting native Windows node...";
@@ -52,14 +64,27 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _selectedPeer = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(IsPeerSelected));
+            SelectedPeerId = value?.DeviceId;
             SelectedPeerLabel = value is null
                 ? "No device selected"
-                : $"{value.DeviceName}  {value.Platform}  {value.Address}:{value.TcpPort}";
-            _ = LoadPeerPanelAsync();
+                : $"{value.DeviceName}  {value.Platform}  {value.PrimaryRouteLabel}";
+            SyncTransportOptions();
+            RestartPanelLoop();
         }
     }
 
     public bool IsPeerSelected => SelectedPeer is not null;
+
+    public string? SelectedPeerId
+    {
+        get => _selectedPeerId;
+        set
+        {
+            if (_selectedPeerId == value) return;
+            _selectedPeerId = value;
+            OnPropertyChanged();
+        }
+    }
 
     public bool IsLoadingPanel
     {
@@ -109,6 +134,27 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         set { _galleryAccessText = value; OnPropertyChanged(); }
     }
 
+    public string SelectedTransportOption
+    {
+        get => _selectedTransportOption;
+        set
+        {
+            if (_selectedTransportOption == value) return;
+            _selectedTransportOption = value;
+            if (SelectedPeer is not null)
+            {
+                _node.SetPreferredTransport(SelectedPeer.DeviceId, value);
+            }
+            OnPropertyChanged();
+        }
+    }
+
+    public string DialNumber
+    {
+        get => _dialNumber;
+        set { _dialNumber = value; OnPropertyChanged(); }
+    }
+
     public MainWindow()
     {
         InitializeComponent();
@@ -143,6 +189,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 {
                     _selectedPeer = updatedSelected;
                     OnPropertyChanged(nameof(SelectedPeer));
+                    SyncTransportOptions();
                 }
             }),
             onEvent: message => Dispatcher.Invoke(() =>
@@ -160,10 +207,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         SendFileCommand = new RelayCommand<PeerView>(SendFile, peer => peer?.Trusted == true);
         RefreshCommand = new RelayCommand<object>(_ => _node.BroadcastNow());
         RefreshPanelCommand = new RelayCommand<object>(_ => _ = LoadPeerPanelAsync(), _ => SelectedPeer?.Trusted == true);
+        DialCommand = new RelayCommand<object>(_ =>
+        {
+            if (!string.IsNullOrWhiteSpace(DialNumber))
+            {
+                _ = TriggerRemoteActionAsync("call.dial", new() { ["number"] = DialNumber });
+            }
+        }, _ => SelectedPeer?.Trusted == true);
+        AnswerCallCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("call.answer"), _ => SelectedPeer?.Trusted == true);
+        OpenWifiSettingsCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("settings.wifi"), _ => SelectedPeer?.Trusted == true);
+        OpenBluetoothSettingsCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("settings.bluetooth"), _ => SelectedPeer?.Trusted == true);
+        OpenLocationSettingsCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("settings.location"), _ => SelectedPeer?.Trusted == true);
+        OpenNotificationSettingsCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("settings.notifications"), _ => SelectedPeer?.Trusted == true);
         DataContext = this;
 
         Loaded += async (_, _) => await _node.StartAsync();
-        Closing += (_, _) => _node.Dispose();
+        Closing += (_, _) =>
+        {
+            _panelLoopCts?.Cancel();
+            _node.Dispose();
+        };
     }
 
     private async Task PairPeerAsync(PeerView? peer)
@@ -202,6 +265,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         try
         {
             var panel = await _node.GetPeerPanelAsync(peer);
+            var stillSelected = SelectedPeer;
+            if (stillSelected?.DeviceId != peer.DeviceId)
+            {
+                return;
+            }
             PanelTitle = panel.Title;
             PanelSubtitle = panel.Subtitle;
             BatteryText = panel.Battery;
@@ -223,6 +291,70 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             IsLoadingPanel = false;
         }
+    }
+
+    private void RestartPanelLoop()
+    {
+        _panelLoopCts?.Cancel();
+        _panelLoopCts = null;
+
+        if (SelectedPeer?.Trusted != true)
+        {
+            _ = LoadPeerPanelAsync();
+            return;
+        }
+
+        var cts = new CancellationTokenSource();
+        _panelLoopCts = cts;
+        _ = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    await Dispatcher.InvokeAsync(() => LoadPeerPanelAsync()).Task.Unwrap();
+                    await Task.Delay(TimeSpan.FromSeconds(3), cts.Token);
+                }
+                catch (TaskCanceledException)
+                {
+                    break;
+                }
+            }
+        }, cts.Token);
+    }
+
+    private void SyncTransportOptions()
+    {
+        var peer = SelectedPeer;
+        var current = SelectedTransportOption;
+        TransportOptions.Clear();
+        TransportOptions.Add("auto");
+        if (peer is not null)
+        {
+            foreach (var transport in peer.AvailableTransports.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                TransportOptions.Add(transport);
+            }
+            SelectedTransportOption = _node.GetPreferredTransport(peer.DeviceId);
+            SelectedPeerLabel = $"{peer.DeviceName}  {peer.Platform}  {peer.PrimaryRouteLabel}";
+        }
+        else
+        {
+            SelectedTransportOption = "auto";
+        }
+        OnPropertyChanged(nameof(TransportOptions));
+        if (!TransportOptions.Contains(current))
+        {
+            OnPropertyChanged(nameof(SelectedTransportOption));
+        }
+    }
+
+    private async Task TriggerRemoteActionAsync(string action, Dictionary<string, object?>? args = null)
+    {
+        var peer = SelectedPeer;
+        if (peer is null || !peer.Trusted) return;
+        await _node.RequestRemoteActionAsync(peer, action, args);
+        await LoadPeerPanelAsync();
     }
 
     private void ResetPanel(string title = "Choose a trusted device", string subtitle = "Pair with an Android phone, then load its device panel from the desktop app.")
@@ -251,4 +383,3 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
     }
 }
-
