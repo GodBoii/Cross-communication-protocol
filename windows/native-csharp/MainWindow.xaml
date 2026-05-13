@@ -115,7 +115,29 @@
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
                     <StackPanel Margin="0,0,0,12">
-                        <TextBlock Text="Nearby devices" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}" FontFamily="{StaticResource Display}"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Nearby devices" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}" FontFamily="{StaticResource Display}"/>
+                            <!-- Long Distance toggle button -->
+                            <Button Grid.Column="1" Command="{Binding ToggleCloudCommand}" Padding="10,5" FontSize="10" ToolTip="Toggle Long Distance cloud relay mode">
+                                <Button.Style>
+                                    <Style TargetType="Button" BasedOn="{StaticResource GhostBtn}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsCloudModeEnabled}" Value="True">
+                                                <Setter Property="Foreground" Value="#22C55E"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Button.Style>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="☁" FontSize="13" Margin="0,0,5,0"/>
+                                    <TextBlock Text="Long Distance" FontSize="10" FontWeight="SemiBold"/>
+                                </StackPanel>
+                            </Button>
+                        </Grid>
                         <TextBlock Text="Pair once, then browse from desktop." Foreground="{StaticResource TextMuted}" FontSize="11" Margin="0,4,0,0"/>
                     </StackPanel>
 
@@ -129,9 +151,62 @@
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="Auto"/>
                                         </Grid.ColumnDefinitions>
-                                        <Border Width="34" Height="34" CornerRadius="{StaticResource R10}" Background="{StaticResource Surface3}" VerticalAlignment="Center">
-                                            <TextBlock Text="{Binding PlatformInitial}" Foreground="{StaticResource TextPrimary}" HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="Bold" FontSize="14"/>
-                                        </Border>
+                                        <Grid Width="34" Height="34" VerticalAlignment="Center">
+                                            <Border CornerRadius="{StaticResource R10}" VerticalAlignment="Stretch" HorizontalAlignment="Stretch">
+                                                <Border.Style>
+                                                    <Style TargetType="Border">
+                                                        <Setter Property="Background" Value="{StaticResource Surface3}"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsCloudPeer}" Value="True">
+                                                                <Setter Property="Background" Value="#153B82F6"/>
+                                                                <Setter Property="BorderBrush" Value="#403B82F6"/>
+                                                                <Setter Property="BorderThickness" Value="1"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Border.Style>
+                                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="Bold" FontSize="14">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Setter Property="Text" Value="{Binding PlatformInitial}"/>
+                                                            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsCloudPeer}" Value="True">
+                                                                    <Setter Property="Text" Value="☁"/>
+                                                                    <Setter Property="Foreground" Value="#3B82F6"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                            </Border>
+                                            <!-- Online indicator dot for cloud peers -->
+                                            <Ellipse Width="8" Height="8" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,-2,-2">
+                                                <Ellipse.Style>
+                                                    <Style TargetType="Ellipse">
+                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                        <Style.Triggers>
+                                                            <MultiDataTrigger>
+                                                                <MultiDataTrigger.Conditions>
+                                                                    <Condition Binding="{Binding IsCloudPeer}" Value="True"/>
+                                                                    <Condition Binding="{Binding CloudOnline}" Value="True"/>
+                                                                </MultiDataTrigger.Conditions>
+                                                                <Setter Property="Visibility" Value="Visible"/>
+                                                                <Setter Property="Fill" Value="{StaticResource StatusGreen}"/>
+                                                            </MultiDataTrigger>
+                                                            <MultiDataTrigger>
+                                                                <MultiDataTrigger.Conditions>
+                                                                    <Condition Binding="{Binding IsCloudPeer}" Value="True"/>
+                                                                    <Condition Binding="{Binding CloudOnline}" Value="False"/>
+                                                                </MultiDataTrigger.Conditions>
+                                                                <Setter Property="Visibility" Value="Visible"/>
+                                                                <Setter Property="Fill" Value="{StaticResource StatusAmber}"/>
+                                                            </MultiDataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Ellipse.Style>
+                                            </Ellipse>
+                                        </Grid>
                                         <StackPanel Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center">
                                             <TextBlock Text="{Binding DeviceName}" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}" TextTrimming="CharacterEllipsis" MaxWidth="120" HorizontalAlignment="Left"/>
                                             <TextBlock Text="{Binding EndpointLabel}" FontSize="10" Foreground="{StaticResource TextMuted}" Margin="0,2,0,0" FontFamily="{StaticResource Mono}" TextTrimming="CharacterEllipsis" MaxWidth="140" HorizontalAlignment="Left"/>
@@ -390,10 +465,51 @@
             <Border.Effect>
                 <DropShadowEffect BlurRadius="15" ShadowDepth="3" Opacity="0.15" Color="Black"/>
             </Border.Effect>
-            <StackPanel Orientation="Horizontal">
-                <Ellipse Width="6" Height="6" Fill="{StaticResource StatusGreen}" Margin="0,0,10,0" VerticalAlignment="Center"/>
-                <TextBlock Text="{Binding FooterStatus}" Foreground="{StaticResource TextMuted}" FontSize="11" FontFamily="{StaticResource Mono}"/>
-            </StackPanel>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="6" Height="6" Fill="{StaticResource StatusGreen}" Margin="0,0,10,0" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding FooterStatus}" Foreground="{StaticResource TextMuted}" FontSize="11" FontFamily="{StaticResource Mono}" TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
+                <!-- Cloud relay status pill -->
+                <Border Grid.Column="1" CornerRadius="12" Padding="10,3" Margin="12,0,0,0" VerticalAlignment="Center">
+                    <Border.Style>
+                        <Style TargetType="Border">
+                            <Setter Property="Background" Value="#15F59E0B"/>
+                            <Setter Property="BorderBrush" Value="#40F59E0B"/>
+                            <Setter Property="BorderThickness" Value="1"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding CloudStatus}" Value="&#x2601; Cloud connected &#x2713;">
+                                    <Setter Property="Background" Value="#1522C55E"/>
+                                    <Setter Property="BorderBrush" Value="#4022C55E"/>
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding CloudStatus}" Value="&#x2601; Cloud relay ready &#x2713;">
+                                    <Setter Property="Background" Value="#1522C55E"/>
+                                    <Setter Property="BorderBrush" Value="#4022C55E"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <TextBlock Text="{Binding CloudStatus}" FontSize="10" FontWeight="Medium">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="#F59E0B"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CloudStatus}" Value="&#x2601; Cloud connected &#x2713;">
+                                        <Setter Property="Foreground" Value="#22C55E"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding CloudStatus}" Value="&#x2601; Cloud relay ready &#x2713;">
+                                        <Setter Property="Foreground" Value="#22C55E"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Border>
+            </Grid>
         </Border>
     </Grid>
     </Grid>

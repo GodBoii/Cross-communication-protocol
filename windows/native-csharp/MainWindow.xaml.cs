@@ -46,9 +46,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public ICommand OpenBluetoothSettingsCommand { get; }
     public ICommand OpenLocationSettingsCommand { get; }
     public ICommand OpenNotificationSettingsCommand { get; }
+    public ICommand ToggleCloudCommand { get; }
 
     public string LocalStatus => "Bridge online";
     public string FooterStatus { get; private set; } = "Starting native Windows node...";
+    public string CloudStatus { get; private set; } = "☁ Connecting…";
+    public bool IsCloudModeEnabled { get; private set; } = false;
 
     public PeerView? SelectedPeer
     {
@@ -219,6 +222,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         OpenBluetoothSettingsCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("settings.bluetooth"), _ => SelectedPeer?.Trusted == true);
         OpenLocationSettingsCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("settings.location"), _ => SelectedPeer?.Trusted == true);
         OpenNotificationSettingsCommand = new RelayCommand<object>(_ => _ = TriggerRemoteActionAsync("settings.notifications"), _ => SelectedPeer?.Trusted == true);
+        ToggleCloudCommand = new RelayCommand<object>(_ => _ = ToggleCloudModeAsync());
         DataContext = this;
 
         Loaded += async (_, _) => await _node.StartAsync();
@@ -227,6 +231,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _panelLoopCts?.Cancel();
             _node.Dispose();
         };
+
+        // Wire cloud status into the footer / status bar
+        _node.Convex.OnCloudStatusChanged += status => Dispatcher.Invoke(() =>
+        {
+            CloudStatus = $"☁ {status}";
+            OnPropertyChanged(nameof(CloudStatus));
+            Events.Insert(0, $"[Cloud] {status}");
+            while (Events.Count > 100) Events.RemoveAt(Events.Count - 1);
+        });
     }
 
     private async Task PairPeerAsync(PeerView? peer)
@@ -355,6 +368,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (peer is null || !peer.Trusted) return;
         await _node.RequestRemoteActionAsync(peer, action, args);
         await LoadPeerPanelAsync();
+    }
+
+    private async Task ToggleCloudModeAsync()
+    {
+        await _node.ToggleCloudModeAsync();
+        IsCloudModeEnabled = _node.IsCloudModeEnabled;
+        OnPropertyChanged(nameof(IsCloudModeEnabled));
     }
 
     private void ResetPanel(string title = "Choose a trusted device", string subtitle = "Pair with an Android phone, then load its device panel from the desktop app.")
