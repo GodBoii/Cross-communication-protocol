@@ -118,8 +118,12 @@ class MainActivity : ComponentActivity() {
         node = AppGraph.node(applicationContext)
         node.start()
         ContextCompat.startForegroundService(this, Intent(this, CcpForegroundService::class.java))
-        if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 20)
+        val startupPermissions = buildList {
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+            if (Build.VERSION.SDK_INT >= 26) add(Manifest.permission.ANSWER_PHONE_CALLS)
+        }.toTypedArray()
+        if (startupPermissions.isNotEmpty()) {
+            requestPermissions(startupPermissions, 20)
         }
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
@@ -205,7 +209,11 @@ fun CcpScreen(
     val snapshot by node.snapshot.collectAsState()
     val recentReceived by node.recentReceived.collectAsState()
     val remotePanel by node.remotePanel.collectAsState()
+    val preferredTransports by node.preferredTransports.collectAsState()
+    val cloudStatus by node.convexBridge.cloudStatus.collectAsState()
+    val cloudMessages by node.convexBridge.cloudMessages.collectAsState()
     var selectedPeer by remember { mutableStateOf<DeviceInfo?>(null) }
+    var inspectedPeerId by remember { mutableStateOf<String?>(null) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         node.refreshLocalData()
     }
@@ -219,6 +227,16 @@ fun CcpScreen(
     // Staggered entrance
     var visible by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { delay(100); visible = true }
+    LaunchedEffect(inspectedPeerId, peers) {
+        val targetId = inspectedPeerId ?: return@LaunchedEffect
+        while (inspectedPeerId == targetId) {
+            val peer = peers.firstOrNull { it.deviceId == targetId }
+            if (peer?.trusted == true) {
+                node.inspectPeer(peer)
+            }
+            delay(3000)
+        }
+    }
 
     Column(
         Modifier
@@ -229,7 +247,7 @@ fun CcpScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         AnimatedVisibility(visible, enter = fadeIn(tween(350)) + slideInVertically(spring(Spring.DampingRatioLowBouncy)) { -20 }) {
-            HeroCard(snapshot)
+            HeroCard(snapshot, cloudStatus)
         }
 
         AnimatedVisibility(visible, enter = fadeIn(tween(350, 80)) + slideInVertically(spring(Spring.DampingRatioLowBouncy)) { -16 }) {
@@ -253,10 +271,20 @@ fun CcpScreen(
         }
 
         AnimatedVisibility(visible, enter = fadeIn(tween(350, 240))) {
-            NearbyDevicesCard(peers = peers, onPair = { node.pair(it) }, onInspect = { node.inspectPeer(it) }, onSend = {
-                selectedPeer = it
-                picker.launch(arrayOf("*/*"))
-            })
+            NearbyDevicesCard(
+                peers = peers,
+                preferredTransports = preferredTransports,
+                onPair = { node.pair(it) },
+                onInspect = {
+                    inspectedPeerId = it.deviceId
+                    node.inspectPeer(it)
+                },
+                onSend = {
+                    selectedPeer = it
+                    picker.launch(arrayOf("*/*"))
+                },
+                onSelectTransport = { peer, transport -> node.setPreferredTransport(peer.deviceId, transport) }
+            )
         }
 
         AnimatedVisibility(visible, enter = fadeIn(tween(350, 320))) {
@@ -274,13 +302,21 @@ fun CcpScreen(
 }
 
 @Composable
-fun HeroCard(snapshot: LocalDeviceSnapshot) {
+fun HeroCard(snapshot: LocalDeviceSnapshot, cloudStatus: String = "") {
     ObsidianCard {
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("CCP", color = TextPrim, fontSize = 26.sp, fontWeight = FontWeight.Bold)
                 Box(Modifier.background(SurfaceGlass, RoundedCornerShape(50)).border(1.dp, BorderGlass, RoundedCornerShape(50)).padding(horizontal = 10.dp, vertical = 3.dp)) {
                     Text("v0.2", color = TextSec, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                }
+                Spacer(Modifier.weight(1f))
+                // Cloud status pill
+                val cloudColor = if (cloudStatus.contains("✓") || cloudStatus.contains("ready")) Color(0xFF22c55e) else AccentBrand
+                Box(Modifier.background(cloudColor.copy(alpha = 0.15f), RoundedCornerShape(50))
+                    .border(1.dp, cloudColor.copy(alpha = 0.4f), RoundedCornerShape(50))
+                    .padding(horizontal = 8.dp, vertical = 2.dp)) {
+                    Text("☁ $cloudStatus", color = cloudColor, fontSize = 10.sp, fontWeight = FontWeight.Medium)
                 }
             }
             Text("Cross-device control surface", color = TextSec, fontSize = 13.sp)
@@ -352,7 +388,14 @@ fun PermissionsCard(
 }
 
 @Composable
-fun NearbyDevicesCard(peers: List<DeviceInfo>, onPair: (DeviceInfo) -> Unit, onInspect: (DeviceInfo) -> Unit, onSend: (DeviceInfo) -> Unit) {
+fun NearbyDevicesCard(
+    peers: List<DeviceInfo>,
+    preferredTransports: Map<String, String>,
+    onPair: (DeviceInfo) -> Unit,
+    onInspect: (DeviceInfo) -> Unit,
+    onSend: (DeviceInfo) -> Unit,
+    onSelectTransport: (DeviceInfo, String) -> Unit
+) {
     ObsidianCard {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Nearby devices", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
@@ -361,7 +404,14 @@ fun NearbyDevicesCard(peers: List<DeviceInfo>, onPair: (DeviceInfo) -> Unit, onI
             } else {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     peers.forEach { peer ->
-                        DeviceRow(peer = peer, onPair = { onPair(peer) }, onInspect = { onInspect(peer) }, onSend = { onSend(peer) })
+                        DeviceRow(
+                            peer = peer,
+                            preferredTransport = preferredTransports[peer.deviceId] ?: "auto",
+                            onPair = { onPair(peer) },
+                            onInspect = { onInspect(peer) },
+                            onSend = { onSend(peer) },
+                            onSelectTransport = { onSelectTransport(peer, it) }
+                        )
                     }
                 }
             }
@@ -463,7 +513,8 @@ fun ActivityCard(events: List<String>) {
 }
 
 @Composable
-fun DeviceRow(peer: DeviceInfo, onPair: () -> Unit, onInspect: () -> Unit, onSend: () -> Unit) {
+@OptIn(ExperimentalLayoutApi::class)
+fun DeviceRow(peer: DeviceInfo, preferredTransport: String, onPair: () -> Unit, onInspect: () -> Unit, onSend: () -> Unit, onSelectTransport: (String) -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -483,6 +534,12 @@ fun DeviceRow(peer: DeviceInfo, onPair: () -> Unit, onInspect: () -> Unit, onSen
             Text(peer.deviceName, fontWeight = FontWeight.SemiBold, color = TextPrim, fontSize = 14.sp)
             Text("${peer.platform}  ${peer.primaryRouteLabel}", fontSize = 11.sp, color = TextMut)
             Text(peer.transportSummary, fontSize = 11.sp, color = TextSec, modifier = Modifier.padding(top = 2.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
+                TransportPill("auto", preferredTransport == "auto") { onSelectTransport("auto") }
+                peer.transports.forEach { transport ->
+                    TransportPill(transport, preferredTransport == transport) { onSelectTransport(transport) }
+                }
+            }
         }
         if (!peer.trusted) {
             OutlinedButton(onClick = onPair, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim), modifier = Modifier.height(36.dp)) {
@@ -496,6 +553,21 @@ fun DeviceRow(peer: DeviceInfo, onPair: () -> Unit, onInspect: () -> Unit, onSen
                 Text("Send", fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
         }
+    }
+}
+
+@Composable
+fun TransportPill(label: String, selected: Boolean, onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick,
+        border = BorderStroke(1.dp, if (selected) AccentBrand else BorderGlass),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = if (selected) AccentBrand.copy(alpha = 0.18f) else ButtonGlass,
+            contentColor = if (selected) AccentBrand else TextSec
+        ),
+        modifier = Modifier.height(28.dp)
+    ) {
+        Text(label.uppercase(), fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
