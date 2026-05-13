@@ -24,6 +24,7 @@ public sealed class CcpNode : IDisposable
 
     private readonly ConfigStore _config = new();
     private readonly ConcurrentDictionary<string, PeerView> _peers = new();
+    private readonly ConcurrentDictionary<string, string?> _preferredTransports = new();
     private readonly Action<IReadOnlyList<PeerView>> _onPeers;
     private readonly Action<string> _onEvent;
     private readonly Func<string, string, bool> _confirm;
@@ -161,6 +162,47 @@ public sealed class CcpNode : IDisposable
             Gallery: ParseItems(gallery?.GetValueOrDefault("items"), "gallery"),
             Files: ParseItems(files?.GetValueOrDefault("items"), "file"),
             Notifications: ParseNotifications(notifications));
+    }
+
+    public string GetPreferredTransport(string deviceId)
+    {
+        return _preferredTransports.TryGetValue(deviceId, out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : "auto";
+    }
+
+    public void SetPreferredTransport(string deviceId, string? transport)
+    {
+        if (string.IsNullOrWhiteSpace(transport) || string.Equals(transport, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            _preferredTransports.TryRemove(deviceId, out _);
+            return;
+        }
+
+        _preferredTransports[deviceId] = transport;
+    }
+
+    public async Task<bool> RequestRemoteActionAsync(PeerView peer, string action, Dictionary<string, object?>? args = null)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["action"] = action,
+            ["args"] = args ?? new Dictionary<string, object?>()
+        };
+
+        var response = await SendSingleAsync(peer, Envelope("remote.action.request", payload));
+        if (response is null)
+        {
+            _onEvent($"No response for remote action {action}");
+            return false;
+        }
+
+        var ok = AsBool(response.Payload.GetValueOrDefault("ok"));
+        var message = AsString(response.Payload.GetValueOrDefault("message"));
+        _onEvent(ok
+            ? $"Remote action completed: {message ?? action}"
+            : $"Remote action failed: {message ?? action}");
+        return ok;
     }
 
     private async Task BroadcastLoopAsync(CancellationToken token)
@@ -344,6 +386,14 @@ public sealed class CcpNode : IDisposable
                             ["items"] = Array.Empty<object>()
                         }));
                         break;
+
+                    case "remote.action.request":
+                        await WriteAsync(writer, Envelope("remote.action.response", new()
+                        {
+                            ["ok"] = false,
+                            ["message"] = "Remote actions are not implemented on Windows yet."
+                        }));
+                        break;
                 }
             }
         }
@@ -408,10 +458,13 @@ public sealed class CcpNode : IDisposable
             ["direct"] = 5
         };
 
+        var preferred = _preferredTransports.TryGetValue(peer.DeviceId, out var transport) ? transport : null;
+
         return routes
             .GroupBy(route => $"{route.Transport}|{route.Host}|{route.Port}", StringComparer.OrdinalIgnoreCase)
             .Select(group => group.First())
-            .OrderBy(route => priority.TryGetValue(route.Transport, out var rank) ? rank : 99);
+            .OrderBy(route => !string.IsNullOrWhiteSpace(preferred) && route.Transport.Equals(preferred, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(route => priority.TryGetValue(route.Transport, out var rank) ? rank : 99);
     }
 
     private CcpMessage Envelope(string type, Dictionary<string, object?> payload)
