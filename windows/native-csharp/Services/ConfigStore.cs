@@ -16,15 +16,34 @@ public sealed class ConfigStore
         var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CCP");
         Directory.CreateDirectory(root);
         _path = Path.Combine(root, "config-windows-native.json");
-        _config = File.Exists(_path)
-            ? JsonSerializer.Deserialize<ConfigDocument>(File.ReadAllText(_path)) ?? ConfigDocument.Create()
-            : ConfigDocument.Create();
+        _config = TryLoad() ?? ConfigDocument.Create();
+        // Migrate: if loaded config is missing a private key, add one
+        if (string.IsNullOrWhiteSpace(_config.PrivateKeyB64))
+        {
+            _config = _config with { PrivateKeyB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) };
+        }
         Save();
+    }
+
+    private ConfigDocument? TryLoad()
+    {
+        try
+        {
+            if (!File.Exists(_path)) return null;
+            return JsonSerializer.Deserialize<ConfigDocument>(File.ReadAllText(_path));
+        }
+        catch
+        {
+            return null; // Corrupt or old format — start fresh
+        }
     }
 
     public string DeviceId => _config.DeviceId;
     public string DeviceName => _config.DeviceName;
     public SenderInfo Sender => new(DeviceId, DeviceName, "windows");
+
+    /// <summary>32-byte random private key used for cloud key exchange.</summary>
+    public byte[] PrivateKey => Convert.FromBase64String(_config.PrivateKeyB64);
 
     public bool IsTrusted(string deviceId) => _config.TrustedPeers.ContainsKey(deviceId);
 
@@ -39,10 +58,11 @@ public sealed class ConfigStore
         File.WriteAllText(_path, JsonSerializer.Serialize(_config, new JsonSerializerOptions { WriteIndented = true }));
     }
 
-    private sealed class ConfigDocument
+    private sealed record ConfigDocument
     {
         public required string DeviceId { get; init; }
         public required string DeviceName { get; init; }
+        public string PrivateKeyB64 { get; init; } = "";  // not required — migrated on load
         public Dictionary<string, SenderInfo> TrustedPeers { get; init; } = [];
 
         public static ConfigDocument Create()
@@ -52,7 +72,8 @@ public sealed class ConfigStore
             return new ConfigDocument
             {
                 DeviceId = hash,
-                DeviceName = $"{Environment.MachineName} Windows"
+                DeviceName = $"{Environment.MachineName} Windows",
+                PrivateKeyB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)),
             };
         }
     }
