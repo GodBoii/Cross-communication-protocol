@@ -1,5 +1,6 @@
 using CCP.Windows.Models;
 using CCP.Windows.Services;
+using CCP.Windows.Ui;
 using Microsoft.Win32;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -19,13 +20,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private string _selectedPeerLabel = "No device selected";
     private string _panelTitle = "Choose a trusted device";
     private string _panelSubtitle = "Pair with an Android phone, then load its device panel from the desktop app.";
-    private string _batteryText = "Unknown";
-    private string _storageText = "Unknown";
-    private string _notificationAccessText = "Unknown";
-    private string _galleryAccessText = "Unknown";
+    private string _batteryText = "—";
+    private string _storageText = "—";
+    private string _notificationAccessText = "—";
+    private string _galleryAccessText = "—";
     private string? _selectedPeerId;
     private string _selectedTransportOption = "auto";
     private string _dialNumber = "";
+    private CloudConnectionState _cloudState = CloudConnectionState.Connecting;
 
     public ObservableCollection<PeerView> Peers { get; } = [];
     public ObservableCollection<string> Events { get; } = [];
@@ -49,9 +51,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public ICommand ToggleCloudCommand { get; }
 
     public string LocalStatus => "Bridge online";
-    public string FooterStatus { get; private set; } = "Starting native Windows node...";
-    public string CloudStatus { get; private set; } = "☁ Connecting…";
+    public string FooterStatus { get; private set; } = "Starting native Windows node…";
     public bool IsCloudModeEnabled { get; private set; } = false;
+
+    /// <summary>Drives the cloud status pill in the app bar (typed; not a fragile string DataTrigger).</summary>
+    public CloudConnectionState CloudState
+    {
+        get => _cloudState;
+        private set
+        {
+            if (_cloudState == value) return;
+            _cloudState = value;
+            OnPropertyChanged();
+        }
+    }
 
     public PeerView? SelectedPeer
     {
@@ -70,7 +83,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             SelectedPeerId = value?.DeviceId;
             SelectedPeerLabel = value is null
                 ? "No device selected"
-                : $"{value.DeviceName}  {value.Platform}  {value.PrimaryRouteLabel}";
+                : $"{value.DeviceName}  ·  {value.Platform}  ·  {value.PrimaryRouteLabel}";
             SyncTransportOptions();
             RestartPanelLoop();
         }
@@ -232,14 +245,25 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _node.Dispose();
         };
 
-        // Wire cloud status into the footer / status bar
+        // Wire cloud status: parse incoming strings into the typed enum so the pill
+        // no longer relies on fragile string DataTriggers.
         _node.Convex.OnCloudStatusChanged += status => Dispatcher.Invoke(() =>
         {
-            CloudStatus = $"☁ {status}";
-            OnPropertyChanged(nameof(CloudStatus));
+            CloudState = ParseCloudState(status);
             Events.Insert(0, $"[Cloud] {status}");
             while (Events.Count > 100) Events.RemoveAt(Events.Count - 1);
         });
+    }
+
+    private static CloudConnectionState ParseCloudState(string status)
+    {
+        if (string.IsNullOrWhiteSpace(status)) return CloudConnectionState.Connecting;
+        var s = status.ToLowerInvariant();
+        if (s.Contains("ready")) return CloudConnectionState.Ready;
+        if (s.Contains("connected")) return CloudConnectionState.Connected;
+        if (s.Contains("offline") || s.Contains("fail") || s.Contains("error")) return CloudConnectionState.Error;
+        if (s.Contains("connecting")) return CloudConnectionState.Connecting;
+        return CloudConnectionState.Connecting;
     }
 
     private async Task PairPeerAsync(PeerView? peer)
@@ -349,7 +373,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 TransportOptions.Add(transport);
             }
             SelectedTransportOption = _node.GetPreferredTransport(peer.DeviceId);
-            SelectedPeerLabel = $"{peer.DeviceName}  {peer.Platform}  {peer.PrimaryRouteLabel}";
+            SelectedPeerLabel = $"{peer.DeviceName}  ·  {peer.Platform}  ·  {peer.PrimaryRouteLabel}";
         }
         else
         {
@@ -381,10 +405,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         PanelTitle = title;
         PanelSubtitle = subtitle;
-        BatteryText = "Unknown";
-        StorageText = "Unknown";
-        NotificationAccessText = "Unknown";
-        GalleryAccessText = "Unknown";
+        BatteryText = "—";
+        StorageText = "—";
+        NotificationAccessText = "—";
+        GalleryAccessText = "—";
         Replace(DeviceSettings, []);
         Replace(GalleryItems, []);
         Replace(FileItems, []);

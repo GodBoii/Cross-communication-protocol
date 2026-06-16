@@ -1,15 +1,11 @@
 # CCP Windows
 
-Windows now has two implementations:
+The Windows client lives entirely in `native-csharp/`. It is a native WPF / .NET 8
+app that gives CCP proper Windows integration: file dialogs, tray support,
+notifications, startup registration, firewall integration, Windows credential
+storage, and access to WinRT / Win32 APIs when needed.
 
-- `native-csharp/`: the main Windows direction. This is a native WPF/.NET app for better Windows integration, packaging, notifications, tray behavior, startup tasks, firewall rules, and future OS APIs.
-- `ccp_windows.py`: a quick Python compatibility rig that is useful for protocol testing.
-
-Use C# for the real app. Keep Python only for fast experiments.
-
-## Native C# App
-
-Build when the .NET Desktop SDK is installed:
+## Build
 
 ```powershell
 cd windows\native-csharp
@@ -24,21 +20,6 @@ cd windows\native-csharp
 dotnet publish -c Release -r win-x64 --self-contained true
 ```
 
-The native app stores trusted peers and identity in `%APPDATA%\CCP\config-windows-native.json`.
-
-## Python Test Rig
-
-```powershell
-cd windows
-python .\ccp_windows.py
-```
-
-## Build EXE Later
-
-```powershell
-cd windows
-python -m pip install pyinstaller
-pyinstaller --onefile --windowed --name CCP-Windows .\ccp_windows.py
-```
-
-The app stores trusted peers and device identity in `%APPDATA%\CCP\config.json`.
+The app stores trusted peers, device identity, and the local private key in
+`%APPDATA%\CCP\config-windows-native.json`. Files received over the LAN are
+saved to `%USERPROFILE%\Downloads\CCP-Inbox\`.

@@ -8,8 +8,7 @@ The repository is split by platform:
 
 - `shared/`: protocol contract and schemas.
 - `android/`: native Kotlin Android app.
-- `windows/native-csharp/`: native WPF Windows app.
-- `windows/ccp_windows.py`: Python prototype kept as a fast protocol test rig.
+- `windows/native-csharp/`: native WPF Windows app (the only Windows implementation).
 - `docs/`: implementation notes and design explanations.
 
 That split is intentional. The user workflow is:
@@ -210,19 +209,7 @@ Recent fixes here matter:
 
 That makes the Android side less brittle during service restarts and repeated app launches.
 
-## 5. Python Prototype
-
-[windows/ccp_windows.py](C:/Users/prajw/Downloads/CCP/windows/ccp_windows.py) is still useful even though C# is now the main Windows path.
-
-It gives:
-
-- a quick protocol sanity check
-- a reference implementation of the wire behavior
-- a backup test surface if the WPF app is mid-refactor
-
-It is not the long-term Windows product surface because Python will be weaker than C# for native Windows integration.
-
-## 6. Current End-to-End Flow
+## 5. Current End-to-End Flow
 
 When everything is running on the same LAN, the flow is:
 
@@ -246,6 +233,19 @@ Major missing areas include:
 
 - transport encryption
 - signed identity keys
+- certificate or trust revocation
+- clipboard sync
+- notification mirroring
+- remote input
+- media control
+- mDNS or BLE discovery
+- Wi-Fi Direct
+- transfer resume
+- streaming large files without full in-memory buffering on Android sends
+- richer permission UX on Android for inbound approvals
+
+Those are the right next layers, but they belong on top of this current native transport foundation rather than replacing it.
+ntity keys
 - certificate or trust revocation
 - clipboard sync
 - notification mirroring

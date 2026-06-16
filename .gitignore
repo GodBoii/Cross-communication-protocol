@@ -1,0 +1,104 @@
+# Dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.idea/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+
+# Capacitor generated web assets
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/app/src/main/res/xml/config.xml
+ios/App/App/public/
+ios/App/App/config.xml
+ios/App/App/capacitor.config.json
+
+# Android
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.externalNativeBuild
+.cxx/
+captures/
+.navigation/
+*.apk
+*.aar
+*.ap_
+*.aab
+*.dex
+*.class
+bin/
+gen/
+out/
+proguard/
+lint/intermediates/
+lint/generated/
+lint/outputs/
+lint/tmp/
+*.hprof
+
+# iOS/macOS
+.DS_Store
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcworkspace
+checkouts/
+Pods/
+
+# .NET / Windows
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.cache
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Temporary files
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+*.bak
+*.orig
+
+# Convex generated files
+convex/_generated/
+
+# Stray / scratch files
+New Text Document.txt

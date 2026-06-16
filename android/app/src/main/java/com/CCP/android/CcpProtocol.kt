@@ -28,10 +28,12 @@ data class DeviceInfo(
     val trusted: Boolean = false,
     val lastSeen: Long = System.currentTimeMillis(),
     val transports: List<String> = emptyList(),
-    val routes: List<ConnectionRoute> = emptyList()
+    val routes: List<ConnectionRoute> = emptyList(),
+    val isCloudPeer: Boolean = false,
+    val cloudOnline: Boolean = false,
 ) {
-    val primaryRouteLabel: String get() = routes.firstOrNull()?.label ?: "$host:$tcpPort"
-    val transportSummary: String get() = if (transports.isEmpty()) "direct tcp" else transports.joinToString(" | ")
+    val primaryRouteLabel: String get() = if (isCloudPeer) "cloud relay" else routes.firstOrNull()?.label ?: "$host:$tcpPort"
+    val transportSummary: String get() = if (isCloudPeer) "long distance ${if (cloudOnline) "online" else "offline"}" else if (transports.isEmpty()) "direct tcp" else transports.joinToString(" | ")
 }
 
 data class RemoteFactItem(

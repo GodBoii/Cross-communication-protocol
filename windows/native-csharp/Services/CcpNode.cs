@@ -30,6 +30,7 @@ public sealed class CcpNode : IDisposable
     private readonly Action<string> _onEvent;
     private readonly Func<string, string, bool> _confirm;
     private readonly CancellationTokenSource _stop = new();
+    private readonly ConcurrentDictionary<string, CloudIncomingTransfer> _cloudIncomingTransfers = new();
 
     // ── Cloud mode state ──────────────────────────────────────────────────
     private bool _cloudModeEnabled;
@@ -110,6 +111,12 @@ public sealed class CcpNode : IDisposable
         if (!peer.Trusted)
         {
             _onEvent("Pair with the device before sending files.");
+            return;
+        }
+
+        if (peer.IsCloudPeer)
+        {
+            await SendFileViaCloudAsync(peer, path);
             return;
         }
 
@@ -378,6 +385,69 @@ public sealed class CcpNode : IDisposable
         return ok;
     }
 
+    private async Task SendFileViaCloudAsync(PeerView peer, string path)
+    {
+        var file = new FileInfo(path);
+        var transferId = Guid.NewGuid().ToString();
+        var fullHash = await Sha256FileAsync(path);
+        var totalChunks = (int)((file.Length + ChunkSize - 1) / ChunkSize);
+
+        _onEvent($"☁ Offering {file.Name} to {peer.DeviceName} via cloud relay…");
+        var offer = await Convex.SendCloudRequestAsync(peer.DeviceId, "file.offer", new JsonObject
+        {
+            ["transfer_id"] = transferId,
+            ["filename"] = file.Name,
+            ["size"] = file.Length,
+            ["sha256"] = fullHash,
+            ["chunk_size"] = ChunkSize,
+            ["total_chunks"] = totalChunks,
+        }, timeoutMs: 30_000);
+
+        if (offer is null || offer["accepted"]?.GetValue<bool>() != true)
+        {
+            var reason = offer?["reason"]?.GetValue<string>();
+            _onEvent($"{peer.DeviceName} rejected {file.Name}{(string.IsNullOrWhiteSpace(reason) ? "" : $": {reason}")}");
+            return;
+        }
+
+        var buffer = new byte[ChunkSize];
+        long sent = 0;
+        await using var input = File.OpenRead(path);
+        for (var index = 0; ; index++)
+        {
+            var read = await input.ReadAsync(buffer);
+            if (read == 0) break;
+
+            var chunk = buffer.AsSpan(0, read).ToArray();
+            var ok = await Convex.PushMessageAsync(peer.DeviceId, "file.chunk", new JsonObject
+            {
+                ["transfer_id"] = transferId,
+                ["index"] = index,
+                ["sha256"] = Sha256Bytes(chunk),
+                ["data_b64"] = Convert.ToBase64String(chunk),
+            }, ttlMs: 10 * 60 * 1000);
+
+            if (!ok)
+            {
+                _onEvent($"☁ Cloud send failed while sending chunk {index} of {file.Name}");
+                return;
+            }
+
+            sent += read;
+            _onEvent($"☁ Sending {file.Name}: {sent} / {file.Length} bytes");
+        }
+
+        var complete = await Convex.SendCloudRequestAsync(peer.DeviceId, "file.complete", new JsonObject
+        {
+            ["transfer_id"] = transferId,
+            ["sha256"] = fullHash,
+        }, timeoutMs: 30_000);
+
+        _onEvent(complete?["ok"]?.GetValue<bool>() == true
+            ? $"☁ Sent and verified {file.Name}"
+            : $"☁ Receiver verification failed for {file.Name}");
+    }
+
     private async Task BroadcastLoopAsync(CancellationToken token)
     {
         while (!token.IsCancellationRequested)
@@ -405,33 +475,95 @@ public sealed class CcpNode : IDisposable
             ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
         });
         var bytes = Encoding.UTF8.GetBytes(packet);
-        await udp.SendAsync(bytes, new IPEndPoint(IPAddress.Broadcast, UdpPort));
+        foreach (var target in GetBroadcastTargets())
+        {
+            try
+            {
+                await udp.SendAsync(bytes, new IPEndPoint(target, UdpPort));
+            }
+            catch (SocketException ex)
+            {
+                _onEvent($"Discovery send failed on {target}: {ex.Message}");
+            }
+        }
+    }
+
+    private static IReadOnlyList<IPAddress> GetBroadcastTargets()
+    {
+        var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            IPAddress.Broadcast.ToString()
+        };
+
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up))
+        {
+            foreach (var address in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (address.Address.AddressFamily != AddressFamily.InterNetwork ||
+                    IPAddress.IsLoopback(address.Address) ||
+                    address.IPv4Mask is null)
+                {
+                    continue;
+                }
+
+                var ip = address.Address.GetAddressBytes();
+                var mask = address.IPv4Mask.GetAddressBytes();
+                var broadcast = new byte[4];
+                for (var i = 0; i < broadcast.Length; i++)
+                {
+                    broadcast[i] = (byte)(ip[i] | ~mask[i]);
+                }
+                targets.Add(new IPAddress(broadcast).ToString());
+            }
+        }
+
+        return targets.Select(IPAddress.Parse).ToList();
     }
 
     private async Task ListenDiscoveryAsync(CancellationToken token)
     {
-        using var udp = new UdpClient(UdpPort) { EnableBroadcast = true };
-        while (!token.IsCancellationRequested)
+        using var udp = new UdpClient { EnableBroadcast = true };
+        udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        udp.Client.Bind(new IPEndPoint(IPAddress.Any, UdpPort));
+        try
         {
-            var result = await udp.ReceiveAsync(token);
-            var doc = JsonDocument.Parse(result.Buffer).RootElement;
-            if (!doc.TryGetProperty("protocol", out var protocol) || protocol.GetString() != Protocol) continue;
-            var deviceId = doc.GetProperty("device_id").GetString() ?? "";
-            if (deviceId == _config.DeviceId) continue;
-
-            var routes = ParseRoutes(doc, result.RemoteEndPoint.Address);
-            UpsertPeer(new PeerView
+            while (!token.IsCancellationRequested)
             {
-                DeviceId = deviceId,
-                DeviceName = doc.GetProperty("device_name").GetString() ?? "Unknown",
-                Platform = doc.GetProperty("platform").GetString() ?? "unknown",
-                Address = result.RemoteEndPoint.Address,
-                TcpPort = doc.GetProperty("tcp_port").GetInt32(),
-                Trusted = _config.IsTrusted(deviceId),
-                LastSeen = DateTime.Now,
-                AvailableTransports = ParseTransportModes(doc),
-                Routes = routes
-            });
+                try
+                {
+                    var result = await udp.ReceiveAsync(token);
+                    var doc = JsonDocument.Parse(result.Buffer).RootElement;
+                    if (!doc.TryGetProperty("protocol", out var protocol) || protocol.GetString() != Protocol) continue;
+                    var deviceId = doc.GetProperty("device_id").GetString() ?? "";
+                    if (deviceId == _config.DeviceId) continue;
+
+                    var routes = ParseRoutes(doc, result.RemoteEndPoint.Address);
+                    UpsertPeer(new PeerView
+                    {
+                        DeviceId = deviceId,
+                        DeviceName = doc.GetProperty("device_name").GetString() ?? "Unknown",
+                        Platform = doc.GetProperty("platform").GetString() ?? "unknown",
+                        Address = result.RemoteEndPoint.Address,
+                        TcpPort = doc.GetProperty("tcp_port").GetInt32(),
+                        Trusted = _config.IsTrusted(deviceId),
+                        LastSeen = DateTime.Now,
+                        AvailableTransports = ParseTransportModes(doc),
+                        Routes = routes
+                    });
+                }
+                catch (JsonException ex)
+                {
+                    _onEvent($"Ignored malformed discovery packet: {ex.Message}");
+                }
+                catch (SocketException ex)
+                {
+                    _onEvent($"Discovery receive failed: {ex.Message}");
+                    await Task.Delay(1000, token).ContinueWith(_ => { });
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
         }
     }
 
@@ -1155,6 +1287,114 @@ public sealed class CcpNode : IDisposable
             {
                 var filename = payload["filename"]?.GetValue<string>() ?? "?";
                 _onEvent($"[Cloud] File offer from {senderShort}…: {filename}");
+                _ = Task.Run(async () =>
+                {
+                    var transferId = payload["transfer_id"]?.GetValue<string>() ?? Guid.NewGuid().ToString();
+                    var response = new JsonObject
+                    {
+                        ["transfer_id"] = transferId,
+                        ["accepted"] = false,
+                        ["resume_from"] = 0,
+                    };
+                    if (requestId is not null) response["request_id"] = requestId;
+
+                    if (!_config.IsTrusted(senderId))
+                    {
+                        response["reason"] = "peer is not paired";
+                        await Convex.PushMessageAsync(senderId, "file.offer.response", response);
+                        return;
+                    }
+
+                    var safeName = SafeFilename(filename);
+                    var allow = _confirm("Incoming Cloud File", $"Accept {safeName} from {senderShort} via cloud relay?");
+                    if (!allow)
+                    {
+                        response["reason"] = "rejected";
+                        await Convex.PushMessageAsync(senderId, "file.offer.response", response);
+                        return;
+                    }
+
+                    var inbox = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "CCP-Inbox");
+                    Directory.CreateDirectory(inbox);
+                    var targetPath = UniquePath(Path.Combine(inbox, safeName));
+                    var output = File.Create(targetPath);
+                    var key = $"{senderId}|{transferId}";
+                    _cloudIncomingTransfers[key] = new CloudIncomingTransfer(
+                        TargetPath: targetPath,
+                        ExpectedHash: payload["sha256"]?.GetValue<string>() ?? "",
+                        Output: output);
+
+                    response["accepted"] = true;
+                    response["reason"] = null;
+                    await Convex.PushMessageAsync(senderId, "file.offer.response", response);
+                    _onEvent($"[Cloud] Receiving {safeName}");
+                });
+                break;
+            }
+
+            case "file.chunk":
+            {
+                var transferId = payload["transfer_id"]?.GetValue<string>() ?? "";
+                var key = $"{senderId}|{transferId}";
+                if (!_cloudIncomingTransfers.TryGetValue(key, out var transfer)) break;
+
+                var raw = Convert.FromBase64String(payload["data_b64"]?.GetValue<string>() ?? "");
+                if (Sha256Bytes(raw) != payload["sha256"]?.GetValue<string>())
+                {
+                    _onEvent($"[Cloud] Chunk checksum failed for {Path.GetFileName(transfer.TargetPath)}");
+                    break;
+                }
+
+                transfer.Lock.Wait();
+                try
+                {
+                    transfer.Output.Write(raw);
+                    _onEvent($"[Cloud] Received chunk {payload["index"]?.ToString() ?? "?"}");
+                }
+                finally
+                {
+                    transfer.Lock.Release();
+                }
+                break;
+            }
+
+            case "file.complete":
+            {
+                _ = Task.Run(async () =>
+                {
+                    var transferId = payload["transfer_id"]?.GetValue<string>() ?? "";
+                    var key = $"{senderId}|{transferId}";
+                    var response = new JsonObject
+                    {
+                        ["transfer_id"] = transferId,
+                        ["ok"] = false,
+                    };
+                    if (requestId is not null) response["request_id"] = requestId;
+
+                    if (_cloudIncomingTransfers.TryRemove(key, out var transfer))
+                    {
+                        await transfer.Lock.WaitAsync();
+                        try
+                        {
+                            await transfer.Output.DisposeAsync();
+                            var actual = await Sha256FileAsync(transfer.TargetPath);
+                            var expected = payload["sha256"]?.GetValue<string>() ?? transfer.ExpectedHash;
+                            var ok = actual == expected && actual == transfer.ExpectedHash;
+                            response["ok"] = ok;
+                            response["sha256"] = actual;
+                            _onEvent(ok
+                                ? $"[Cloud] Received and verified {transfer.TargetPath}"
+                                : $"[Cloud] Checksum failed for {transfer.TargetPath}");
+                        }
+                        finally
+                        {
+                            transfer.Lock.Release();
+                            transfer.Lock.Dispose();
+                        }
+                    }
+
+                    await Convex.PushMessageAsync(senderId, "file.complete.response", response);
+                });
                 break;
             }
 
@@ -1230,8 +1470,21 @@ public sealed class CcpNode : IDisposable
     public void Dispose()
     {
         _stop.Cancel();
+        foreach (var transfer in _cloudIncomingTransfers.Values)
+        {
+            transfer.Output.Dispose();
+            transfer.Lock.Dispose();
+        }
         _stop.Dispose();
         _ = Convex.StopAsync();
         Convex.Dispose();
+    }
+
+    private sealed record CloudIncomingTransfer(
+        string TargetPath,
+        string ExpectedHash,
+        FileStream Output)
+    {
+        public SemaphoreSlim Lock { get; } = new(1, 1);
     }
 }
