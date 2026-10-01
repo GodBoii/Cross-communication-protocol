@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
-import android.media.MediaScannerConnection
 import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -18,6 +17,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.text.format.Formatter
 import android.webkit.MimeTypeMap
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -37,34 +37,32 @@ data class LocalDeviceSnapshot(
 class DeviceDataRepository(private val context: Context) {
     private val prefs = context.getSharedPreferences("ccp_device_data", Context.MODE_PRIVATE)
 
-    fun saveIncomingFile(fileName: String, bytes: ByteArray): JSONObject {
+    /**
+     * Moves a verified received file into shared storage, streaming from
+     * [source] so large files never sit in memory. The caller deletes [source].
+     */
+    @Synchronized
+    fun saveIncomingFile(fileName: String, source: File): JSONObject {
         val mimeType = guessMimeType(fileName)
+        val type = if (mimeType.startsWith("image/") || mimeType.startsWith("video/")) "gallery" else "file"
         val now = System.currentTimeMillis()
-        val record = when {
-            mimeType.startsWith("image/") -> saveToMediaStore(
-                collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
-                directory = "Pictures/CCP",
-                fileName = fileName,
-                mimeType = mimeType,
-                bytes = bytes,
-                type = "gallery"
-            )
-            mimeType.startsWith("video/") -> saveToMediaStore(
-                collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
-                directory = "Movies/CCP",
-                fileName = fileName,
-                mimeType = mimeType,
-                bytes = bytes,
-                type = "gallery"
-            )
-            else -> saveToMediaStore(
-                collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
-                directory = "Download/CCP",
-                fileName = fileName,
-                mimeType = mimeType,
-                bytes = bytes,
-                type = "file"
-            )
+        val record = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            when {
+                mimeType.startsWith("image/") -> saveToMediaStore(
+                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                    "Pictures/CCP", fileName, mimeType, source, type
+                )
+                mimeType.startsWith("video/") -> saveToMediaStore(
+                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                    "Movies/CCP", fileName, mimeType, source, type
+                )
+                else -> saveToMediaStore(
+                    MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                    "Download/CCP", fileName, mimeType, source, type
+                )
+            }
+        } else {
+            saveToAppStorage(fileName, mimeType, source, type)
         }.put("received_at", now)
 
         val existing = loadJsonArray("recent_received")
@@ -80,8 +78,12 @@ class DeviceDataRepository(private val context: Context) {
     fun localSnapshot(notificationAccessEnabled: Boolean, galleryAccessEnabled: Boolean): LocalDeviceSnapshot {
         val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
         val battery = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-        val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as StorageManager
-        val primaryStorage = storageManager.storageVolumes.firstOrNull()?.directory
+        // StorageVolume.directory is API 30+; the data partition works on every supported version.
+        val primaryStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            (context.getSystemService(Context.STORAGE_SERVICE) as StorageManager).storageVolumes.firstOrNull()?.directory
+        } else {
+            Environment.getDataDirectory()
+        }
         val storage = primaryStorage?.let { dir ->
             val total = dir.totalSpace
             val free = dir.freeSpace
@@ -188,14 +190,16 @@ class DeviceDataRepository(private val context: Context) {
         return result
     }
 
+    @RequiresApi(Build.VERSION_CODES.Q)
     private fun saveToMediaStore(
         collection: Uri,
         directory: String,
         fileName: String,
         mimeType: String,
-        bytes: ByteArray,
+        source: File,
         type: String
     ): JSONObject {
+        val resolver = context.contentResolver
         val contentValues = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
             put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
@@ -203,20 +207,45 @@ class DeviceDataRepository(private val context: Context) {
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
 
-        val uri = requireNotNull(context.contentResolver.insert(collection, contentValues))
-        context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-        contentValues.clear()
-        contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
-        context.contentResolver.update(uri, contentValues, null, null)
-
-        MediaScannerConnection.scanFile(context, arrayOf(uri.toString()), arrayOf(mimeType), null)
+        val uri = requireNotNull(resolver.insert(collection, contentValues)) { "Could not create $fileName in $directory" }
+        try {
+            val output = requireNotNull(resolver.openOutputStream(uri)) { "Could not open $fileName for writing" }
+            output.use { out -> source.inputStream().use { it.copyTo(out, 64 * 1024) } }
+            contentValues.clear()
+            contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            resolver.update(uri, contentValues, null, null)
+        } catch (e: Exception) {
+            // Don't leave a pending, half-written entry behind.
+            runCatching { resolver.delete(uri, null, null) }
+            throw e
+        }
 
         return JSONObject()
             .put("name", fileName)
-            .put("size", bytes.size)
+            .put("size", source.length())
             .put("mime_type", mimeType)
             .put("location", directory)
             .put("uri", uri.toString())
+            .put("type", type)
+    }
+
+    /** Android 8–9: scoped MediaStore columns don't exist, so keep files in app storage. */
+    private fun saveToAppStorage(fileName: String, mimeType: String, source: File, type: String): JSONObject {
+        val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir, "CCP").apply { mkdirs() }
+        var target = File(dir, fileName)
+        var index = 1
+        val stem = fileName.substringBeforeLast('.', fileName)
+        val ext = fileName.substringAfterLast('.', "").let { if (it.isEmpty()) "" else ".$it" }
+        while (target.exists()) target = File(dir, "$stem-${index++}$ext")
+        if (!source.renameTo(target)) {
+            source.inputStream().use { input -> target.outputStream().use { input.copyTo(it, 64 * 1024) } }
+        }
+        return JSONObject()
+            .put("name", target.name)
+            .put("size", target.length())
+            .put("mime_type", mimeType)
+            .put("location", "App storage/Download/CCP")
+            .put("uri", Uri.fromFile(target).toString())
             .put("type", type)
     }
 

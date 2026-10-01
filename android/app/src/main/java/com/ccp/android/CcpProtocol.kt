@@ -6,7 +6,8 @@ import java.io.InputStream
 import java.security.MessageDigest
 import java.util.UUID
 
-const val CCP_PROTOCOL = "ccp.v0"
+/** v1: ECDH pairing and encrypted LAN sessions; not wire-compatible with v0. */
+const val CCP_PROTOCOL = "ccp.v1"
 const val CCP_UDP_PORT = 47827
 const val CCP_TCP_PORT = 47828
 const val CCP_CHUNK_SIZE = 64 * 1024

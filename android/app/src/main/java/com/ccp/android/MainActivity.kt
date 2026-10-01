@@ -69,7 +69,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -211,6 +214,7 @@ fun CcpScreen(
     val remotePanel by node.remotePanel.collectAsState()
     val preferredTransports by node.preferredTransports.collectAsState()
     val pendingPairRequest by node.pendingPairRequest.collectAsState()
+    val outgoingPair by node.outgoingPair.collectAsState()
     val cloudStatus by node.convexBridge.cloudStatus.collectAsState()
     val cloudMessages by node.convexBridge.cloudMessages.collectAsState()
     var selectedPeer by remember { mutableStateOf<DeviceInfo?>(null) }
@@ -228,14 +232,19 @@ fun CcpScreen(
     // Staggered entrance
     var visible by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { delay(100); visible = true }
-    LaunchedEffect(inspectedPeerId, peers) {
+    // Keyed only on the inspected id: keying on `peers` restarted the loop on
+    // every discovery packet and fired a refresh each time.
+    val latestPeers by rememberUpdatedState(peers)
+    LaunchedEffect(inspectedPeerId) {
         val targetId = inspectedPeerId ?: return@LaunchedEffect
-        while (inspectedPeerId == targetId) {
-            val peer = peers.firstOrNull { it.deviceId == targetId }
+        while (true) {
+            delay(5_000)
+            val peer = latestPeers.firstOrNull { it.deviceId == targetId }
             if (peer?.trusted == true) {
+                // Cloud refreshes are slower and cost relay traffic; refresh less often.
                 node.inspectPeer(peer)
+                if (peer.isCloudPeer) delay(25_000)
             }
-            delay(3000)
         }
     }
 
@@ -269,6 +278,12 @@ fun CcpScreen(
                 openNotificationAccess = openNotificationAccess,
                 openAppNotificationSettings = openAppNotificationSettings
             )
+        }
+
+        AnimatedVisibility(outgoingPair != null, enter = fadeIn(tween(200))) {
+            outgoingPair?.let { pairing ->
+                OutgoingPairCard(pairing = pairing, onCancel = { node.cancelOutgoingPair() })
+            }
         }
 
         AnimatedVisibility(pendingPairRequest != null, enter = fadeIn(tween(200))) {
@@ -313,6 +328,29 @@ fun CcpScreen(
     }
 }
 
+private fun formatPairCode(code: String): String =
+    if (code.length == 6) "${code.substring(0, 3)} ${code.substring(3)}" else code
+
+@Composable
+fun OutgoingPairCard(pairing: OutgoingPairCode, onCancel: () -> Unit) {
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Pairing with ${pairing.deviceName}", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+            Text(
+                formatPairCode(pairing.code),
+                color = TextPrim,
+                fontSize = 26.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.semantics { contentDescription = "Pairing code ${pairing.code.toCharArray().joinToString(" ")}" }
+            )
+            Text("Confirm the same code is shown on ${pairing.deviceName}, then approve it there.", color = TextSec, fontSize = 13.sp)
+            OutlinedButton(onClick = onCancel, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim), modifier = Modifier.height(38.dp)) {
+                Text("Cancel", fontSize = 13.sp)
+            }
+        }
+    }
+}
+
 @Composable
 fun PairApprovalCard(
     request: PendingPairRequest,
@@ -323,7 +361,26 @@ fun PairApprovalCard(
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Pairing request", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
             Text("${request.deviceName}  ${request.platform}", color = TextSec, fontSize = 13.sp)
-            Text("Code ${request.pairCode}", color = TextPrim, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(
+                formatPairCode(request.pairCode),
+                color = TextPrim,
+                fontSize = 26.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.semantics { contentDescription = "Pairing code ${request.pairCode.toCharArray().joinToString(" ")}" }
+            )
+            Text(
+                "Approve only if ${request.deviceName} shows exactly this code.",
+                color = TextSec,
+                fontSize = 13.sp
+            )
+            if (request.alreadyPaired) {
+                Text(
+                    "This device is already paired. Approving replaces its keys; reject if you didn't start this.",
+                    color = TextPrim,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = onApprove, colors = ButtonDefaults.buttonColors(containerColor = AccentBrand, contentColor = Void), modifier = Modifier.height(38.dp)) {
                     Text("Approve", fontSize = 13.sp, fontWeight = FontWeight.Bold)

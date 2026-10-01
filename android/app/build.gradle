@@ -12,10 +12,15 @@ android {
         versionCode = 1
         versionName = "0.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Override with -PccpConvexUrl=https://<deployment>.convex.cloud
+        def convexUrl = project.findProperty("ccpConvexUrl") ?: "https://reminiscent-raven-475.convex.cloud"
+        buildConfigField "String", "CONVEX_URL", "\"${convexUrl}\""
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {

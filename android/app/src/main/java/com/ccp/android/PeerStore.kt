@@ -12,6 +12,10 @@ import java.security.SecureRandom
  * Identity (v1): a random cloud auth token is generated once; the public
  * device id is sha256("ccp-device-id-v1:" + sha256(token)), which lets the
  * Convex backend verify that a caller owns the id it registers.
+ *
+ * Trust (v1): a peer is trusted only if we hold a 32-byte pair secret derived
+ * from an approved ECDH pairing. Pre-v1 secrets were sent over the LAN in
+ * plain text, so they are discarded and those peers must pair again.
  */
 class PeerStore(context: Context) {
     private val prefs = context.getSharedPreferences("ccp_native", Context.MODE_PRIVATE)
@@ -27,6 +31,10 @@ class PeerStore(context: Context) {
     val deviceName: String = prefs.getString("device_name", null)
         ?: (Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android CCP")
 
+    init {
+        dropLegacySecrets()
+    }
+
     fun sender(): JSONObject {
         return JSONObject()
             .put("device_id", deviceId)
@@ -34,21 +42,44 @@ class PeerStore(context: Context) {
             .put("platform", "android")
     }
 
-    fun isTrusted(deviceId: String): Boolean = prefs.contains("peer.$deviceId")
+    fun isTrusted(deviceId: String): Boolean = pairSecretBytes(deviceId) != null
 
-    fun pairSecret(deviceId: String): String? =
-        prefs.getString("peer_secret.$deviceId", null)
+    /** The 32-byte v1 pair secret, or null if the peer isn't (or is no longer) paired. */
+    fun pairSecretBytes(deviceId: String): ByteArray? {
+        if (!isValidDeviceId(deviceId)) return null
+        val encoded = prefs.getString(SECRET_PREFIX + deviceId, null) ?: return null
+        return runCatching { Base64.decode(encoded, Base64.NO_WRAP) }.getOrNull()?.takeIf { it.size == 32 }
+    }
 
-    fun trust(sender: JSONObject, pairSecretB64: String? = null) {
-        val deviceId = sender.getString("device_id")
+    fun peerInfo(deviceId: String): JSONObject? =
+        prefs.getString(PEER_PREFIX + deviceId, null)?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+    fun trustedPeerIds(): List<String> =
+        prefs.all.keys.filter { it.startsWith(SECRET_PREFIX) }.map { it.removePrefix(SECRET_PREFIX) }.filter(::isValidDeviceId)
+
+    fun trust(peer: JSONObject, pairSecret: ByteArray) {
+        require(pairSecret.size == 32) { "pair secret must be 32 bytes" }
+        val deviceId = peer.getString("device_id")
+        require(isValidDeviceId(deviceId)) { "invalid device id" }
+        val info = JSONObject()
+            .put("device_id", deviceId)
+            .put("device_name", peer.optString("device_name", "Unknown").take(64))
+            .put("platform", peer.optString("platform", "unknown").take(16))
+            .put("paired_at", System.currentTimeMillis())
         prefs.edit()
-            .putString("peer.$deviceId", sender.toString())
-            .apply {
-                if (!pairSecretB64.isNullOrBlank()) {
-                    putString("peer_secret.$deviceId", pairSecretB64)
-                }
-            }
+            .putString(PEER_PREFIX + deviceId, info.toString())
+            .putString(SECRET_PREFIX + deviceId, Base64.encodeToString(pairSecret, Base64.NO_WRAP))
             .apply()
+    }
+
+    fun forget(deviceId: String) {
+        prefs.edit().remove(PEER_PREFIX + deviceId).remove(SECRET_PREFIX + deviceId).apply()
+    }
+
+    private fun dropLegacySecrets() {
+        val legacy = prefs.all.keys.filter { it.startsWith(LEGACY_SECRET_PREFIX) }
+        if (legacy.isEmpty()) return
+        prefs.edit().apply { legacy.forEach { remove(it) } }.apply()
     }
 
     private fun loadOrCreateCloudToken(context: Context): String {
@@ -66,6 +97,9 @@ class PeerStore(context: Context) {
 
     companion object {
         const val DEVICE_ID_PREFIX = "ccp-device-id-v1:"
+        private const val PEER_PREFIX = "peer."
+        private const val SECRET_PREFIX = "peer_secret_v1."
+        private const val LEGACY_SECRET_PREFIX = "peer_secret."
 
         fun deriveDeviceId(cloudAuthToken: String): String {
             val tokenHash = sha256Hex(cloudAuthToken.toByteArray(Charsets.UTF_8))
