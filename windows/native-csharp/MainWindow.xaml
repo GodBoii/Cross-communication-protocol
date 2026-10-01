@@ -563,7 +563,7 @@
                     <Ellipse Width="6" Height="6" Fill="{StaticResource SuccessBrush}" Margin="0,0,8,0" VerticalAlignment="Center"/>
                     <TextBlock Text="{Binding FooterStatus}" FontSize="{StaticResource FsCaption}" FontFamily="{StaticResource MonoFont}" Foreground="{StaticResource TextMuted}" TextTrimming="CharacterEllipsis"/>
                 </StackPanel>
-                <TextBlock Grid.Column="1" Text="ccp.v0  ·  UDP 47827  ·  TCP 47828" FontSize="{StaticResource FsCaption}" FontFamily="{StaticResource MonoFont}" Foreground="{StaticResource TextMuted}" VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="1" Text="ccp.v1  ·  UDP 47827  ·  TCP 47828" FontSize="{StaticResource FsCaption}" FontFamily="{StaticResource MonoFont}" Foreground="{StaticResource TextMuted}" VerticalAlignment="Center"/>
             </Grid>
         </Border>
     </Grid>

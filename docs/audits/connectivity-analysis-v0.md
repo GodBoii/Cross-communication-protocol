@@ -1,3 +1,5 @@
+> **Historical (v0).** Written before the v1 hardening. Directed-broadcast targets, bind error handling, encrypted LAN sessions and the relay changes it discusses have since been implemented; see `shared/protocol/ccp-v1.md`.
+
 # CCP Connectivity — Deep Analysis Report
 
 > Wi-Fi · Bluetooth · Wired (Ethernet / USB-RNDIS) · Cloud (Convex)
