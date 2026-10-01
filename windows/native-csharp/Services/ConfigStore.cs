@@ -70,14 +70,8 @@ public sealed class ConfigStore
         Save();
     }
 
-    public const string DeviceIdPrefix = "ccp-device-id-v1:";
-
     /// <summary>device_id = sha256_hex("ccp-device-id-v1:" + sha256_hex(token)).</summary>
-    public static string DeriveDeviceId(string cloudAuthToken)
-    {
-        var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cloudAuthToken))).ToLowerInvariant();
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(DeviceIdPrefix + tokenHash))).ToLowerInvariant();
-    }
+    public static string DeriveDeviceId(string cloudAuthToken) => CcpIdentity.DeriveDeviceId(cloudAuthToken);
 
     private void Save()
     {

@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "generator": "shared/test-vectors/generate.mjs (Node crypto)",
+  "hkdf": [
+    {
+      "ikm_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "salt_hex": "000102030405060708090a0b0c",
+      "info": "ccp-test",
+      "length": 42,
+      "okm_hex": "796d43038def7ae96eaf4db86d3a30efe3110b7664dff21994231af2344431c3891db98aec6866235b8c"
+    },
+    {
+      "ikm_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "salt_hex": "",
+      "info": "ccp-empty-salt",
+      "length": 32,
+      "okm_hex": "06cb26f454b83fbbc6c4df96323b7c88a4e07d2d5d88169c8143e064b9974ece"
+    }
+  ],
+  "ecdh": {
+    "a_pkcs8_b64": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgEZjLBeYnAF/GERVBM7YZccAXxcM8XT1LiRDxrkjFkr6hRANCAASFWXNaF8jkTlAfo4oFg/tzv5voE9sDx9sVds6ylVXPYz4BaEvAJeuXsKROvpFJZJyG+4Ye9cirbFkk5zn1nOyq",
+    "a_spki_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhVlzWhfI5E5QH6OKBYP7c7+b6BPbA8fbFXbOspVVz2M+AWhLwCXrl7CkTr6RSWSchvuGHvXIq2xZJOc59Zzsqg==",
+    "b_pkcs8_b64": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNPsihvEITKDBV9KPl0bDiyemobYQMPv+gGOud4fCvUahRANCAATFpHz4fzl5WWPC5b5Qn5GVZT571l1DIF7/o92BrhSz8LjuGkPUKL9NqkBKdHuYJsC07mMcxiCGgG5tn2BrWIm1",
+    "b_spki_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExaR8+H85eVljwuW+UJ+RlWU+e9ZdQyBe/6Pdga4Us/C47hpD1Ci/TapASnR7mCbAtO5jHMYghoBubZ9ga1iJtQ==",
+    "shared_hex": "931df400ccb83cba267070ce3828c7d50aac6b1acb07f5643cb7012666bc779f"
+  },
+  "pairing": {
+    "initiator_id": "59eb3cb130074f7b1ddb99c8fe14f27e1dbca735bb3da82e1ff0305340a32419",
+    "responder_id": "6dcde155f1f900e157d25bb5c24b1a54d71ea35b78661ed9b1a8be3532c3d4f5",
+    "initiator_pub_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhVlzWhfI5E5QH6OKBYP7c7+b6BPbA8fbFXbOspVVz2M+AWhLwCXrl7CkTr6RSWSchvuGHvXIq2xZJOc59Zzsqg==",
+    "responder_pub_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExaR8+H85eVljwuW+UJ+RlWU+e9ZdQyBe/6Pdga4Us/C47hpD1Ci/TapASnR7mCbAtO5jHMYghoBubZ9ga1iJtQ==",
+    "initiator_nonce_b64": "EBESExQVFhcYGRobHB0eHw==",
+    "responder_nonce_b64": "QEFCQ0RFRkdISUpLTE1OTw==",
+    "shared_hex": "931df400ccb83cba267070ce3828c7d50aac6b1acb07f5643cb7012666bc779f",
+    "commitment_hex": "55be7cb66173538786d825cb93e5692235a4baa816729320babae051e708580a",
+    "transcript_hash_hex": "1885f294bf31651a71a995ddc423477ac6e8876495f7525af237ce8736afa425",
+    "pair_secret_b64": "3cvAI/gBH8aMhV72Hljvx6jUZK1jmmNtQjbqjJC4zDI=",
+    "sas": "651116",
+    "responder_confirm_b64": "FbAU3vQrH3vkUoOoXh6pM6YcELOCApyiJagt8IYj+rc="
+  },
+  "lan_channel": {
+    "pair_secret_b64": "3cvAI/gBH8aMhV72Hljvx6jUZK1jmmNtQjbqjJC4zDI=",
+    "client_id": "59eb3cb130074f7b1ddb99c8fe14f27e1dbca735bb3da82e1ff0305340a32419",
+    "server_id": "6dcde155f1f900e157d25bb5c24b1a54d71ea35b78661ed9b1a8be3532c3d4f5",
+    "client_nonce_b64": "gIGCg4SFhoeIiYqLjI2Ojw==",
+    "server_nonce_b64": "oKGio6SlpqeoqaqrrK2urw==",
+    "c2s_key_hex": "9af3bbde81faf9ca8bbea4d7d8b02701a7a74be1f790ee48bd13af8a4344ec27",
+    "s2c_key_hex": "eee394d5a9ee6be9f8d4cfb44d1c71a4a678d4200904ddf81d906bfb74aebb43",
+    "frames": [
+      {
+        "direction": "c2s",
+        "counter": 0,
+        "plaintext": "{\"type\":\"device.snapshot.request\"}",
+        "sealed_b64": "Z5xeO2lyVqTx5mKI/BF4Zp/CZntANs/y1QpJII9LdpXQLjOOalBOdN6JjH5YLVjnQyM="
+      },
+      {
+        "direction": "c2s",
+        "counter": 1,
+        "plaintext": "second frame",
+        "sealed_b64": "uNab7M6NnEHQmMVHmNVd6/eI9d4Ir2YyxppS0A=="
+      },
+      {
+        "direction": "s2c",
+        "counter": 0,
+        "plaintext": "{\"type\":\"device.snapshot.response\",\"payload\":{}}",
+        "sealed_b64": "2kXYxbfkv9Rn2KyUfajwDtSqCUe22NabetcfbEIS8WkrswTPhPFHVh45sks0JuzabeRE9k5uHQmki1YuSgd2zg=="
+      }
+    ]
+  },
+  "cloud": {
+    "pair_secret_b64": "3cvAI/gBH8aMhV72Hljvx6jUZK1jmmNtQjbqjJC4zDI=",
+    "device_a": "59eb3cb130074f7b1ddb99c8fe14f27e1dbca735bb3da82e1ff0305340a32419",
+    "device_b": "6dcde155f1f900e157d25bb5c24b1a54d71ea35b78661ed9b1a8be3532c3d4f5",
+    "cloud_key_hex": "0206d7c897e897b0cbc8ddbd2a4a575ee40004a595b8d3d921323ca2d45a05d4",
+    "wrap_key_hex": "5a0cbeebb48615ea386720153990810fd0e065f54861a7617e1382f8bcf358fa",
+    "fingerprint_hex": "74ad3183366f4e1d31a3068cb1dd39718a98d5d94ad07eddf877b01b14a76980",
+    "message": {
+      "sender_id": "59eb3cb130074f7b1ddb99c8fe14f27e1dbca735bb3da82e1ff0305340a32419",
+      "recipient_id": "6dcde155f1f900e157d25bb5c24b1a54d71ea35b78661ed9b1a8be3532c3d4f5",
+      "msg_type": "remote.action.request",
+      "msg_id": "00000000-0000-4000-8000-000000000001",
+      "nonce_b64": "wMHCw8TFxsfIycrL",
+      "plaintext": "{\"action\":\"settings.wifi\"}",
+      "aad": "ccp-cloud-msg-v1|59eb3cb130074f7b1ddb99c8fe14f27e1dbca735bb3da82e1ff0305340a32419|6dcde155f1f900e157d25bb5c24b1a54d71ea35b78661ed9b1a8be3532c3d4f5|remote.action.request|00000000-0000-4000-8000-000000000001",
+      "ciphertext_b64": "4PmMPZEa04Y9mWdhjw0+ROboDGGFqcUyko1UbUzZ0Pxr+0kYvzHbyBeq"
+    }
+  },
+  "device_id": {
+    "auth_token": "dGVzdC1jbG91ZC1hdXRoLXRva2VuLTMyLWJ5dGVzISE=",
+    "auth_token_hash": "ac3c1fdbc65382766ab33b878649af704dc2c8a1ea9d56e8f7291dc73bd3dfed",
+    "device_id": "529a5671c1660f627b9cb08dec5adfd129ae186ea7bb807b190ef71710acc840"
+  }
+}
