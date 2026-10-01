@@ -68,14 +68,14 @@ class ConvexBridge(
         context.getSharedPreferences("ccp_convex", Context.MODE_PRIVATE)
 
     // ── Key material ────────────────────────────────────────────────────────
-    // X25519 is available in Android API 31+; for broad compat we use
-    // AES-256 with a random 32-byte ephemeral key and store an ECDH-like
-    // derivation via HKDF-SHA256 over (myPrivate ⊕ peerPublic).
+    // Public key is retained for device identity display. Cloud session keys are
+    // derived from the per-pair secret exchanged during approved local pairing.
     private val privateKeyBytes: ByteArray = getOrCreatePrivateKey()
     val publicKeyB64: String = Base64.encodeToString(
         sha256(privateKeyBytes + "ccp-pub".toByteArray()), Base64.NO_WRAP
     )
-    private val machineSecret: ByteArray = deriveMachineSecret()
+    private val cloudAuthToken: String = getOrCreateCloudAuthToken()
+    private val cloudAuthTokenHash: String = sha256(cloudAuthToken.toByteArray()).toHex()
 
     // In-memory session cache: peer_device_id → raw 32-byte AES key
     private val sessionKeys = HashMap<String, ByteArray>()
@@ -104,6 +104,7 @@ class ConvexBridge(
                     put("device_name", deviceName)
                     put("platform", platform)
                     put("public_key_b64", publicKeyB64)
+                    put("auth_token_hash", cloudAuthTokenHash)
                     put("capabilities", JSONArray(capabilities))
                     put("app_version", appVersion)
                 })
@@ -121,7 +122,11 @@ class ConvexBridge(
     fun stop() {
         running = false
         scope.launch {
-            try { mutation("presence:goOffline", JSONObject().put("device_id", deviceId)) }
+            try {
+                mutation("presence:goOffline", JSONObject()
+                    .put("device_id", deviceId)
+                    .put("auth_token", cloudAuthToken))
+            }
             catch (_: Exception) {}
         }
     }
@@ -130,45 +135,43 @@ class ConvexBridge(
 
     /**
      * Call this after a successful local WiFi pairing.
-     * Performs pseudo-ECDH, stores encrypted key blobs in Convex.
+     * The cloud session is derived from the local pair secret rather than any
+     * public device identifier, so Convex cannot unwrap stored sessions.
      */
     fun completeKeyExchange(
         peerDeviceId: String,
         peerPublicKeyB64: String,
+        pairSecretB64: String?,
         pairedVia: String = "wifi",
     ): String {
-        val peerPub = Base64.decode(peerPublicKeyB64, Base64.NO_WRAP)
-
-        // Pseudo-ECDH: derive shared secret from both keys
-        val sharedSecret = sha256(privateKeyBytes + peerPub)
-        val sessionKey = hkdf(sharedSecret, "ccp-session-v0".toByteArray(), 32)
-        val fingerprint = sha256(sharedSecret).toHex()
-
-        // Encrypt our copy with our machine secret
-        val myEncrypted = encryptAesGcm(machineSecret, sessionKey)
-        val myBlob = Base64.encodeToString(
-            JSONObject(myEncrypted).toString().toByteArray(), Base64.NO_WRAP
-        )
-
-        // Encrypt peer's copy with a key derived from their device_id
-        val peerMachineSecret = hkdf(peerDeviceId.toByteArray(), "ccp-machine-v0".toByteArray(), 32)
-        val peerEncrypted = encryptAesGcm(peerMachineSecret, sessionKey)
-        val peerBlob = Base64.encodeToString(
-            JSONObject(peerEncrypted).toString().toByteArray(), Base64.NO_WRAP
-        )
-
+        if (pairSecretB64.isNullOrBlank()) {
+            logCloud("Session skipped for ${peerDeviceId.take(8)}…: missing pair secret")
+            return ""
+        }
+        val pairSecret = Base64.decode(pairSecretB64, Base64.NO_WRAP)
         val idA = minOf(deviceId, peerDeviceId)
         val idB = maxOf(deviceId, peerDeviceId)
-        val encA = if (deviceId <= peerDeviceId) myBlob else peerBlob
-        val encB = if (deviceId <= peerDeviceId) peerBlob else myBlob
+        val sessionKey = hkdf(
+            pairSecret + "$idA|$idB".toByteArray(),
+            "ccp-session-v1".toByteArray(),
+            32
+        )
+        val wrapKey = hkdf(pairSecret, "ccp-session-wrap-v1".toByteArray(), 32)
+        val encryptedBlob = Base64.encodeToString(
+            JSONObject(encryptAesGcm(wrapKey, sessionKey)).toString().toByteArray(),
+            Base64.NO_WRAP
+        )
+        val fingerprint = sha256(sessionKey).toHex()
 
         scope.launch {
             try {
                 mutation("sessions:storeSession", JSONObject().apply {
                     put("device_id_a", idA)
                     put("device_id_b", idB)
-                    put("encrypted_key_a", encA)
-                    put("encrypted_key_b", encB)
+                    put("caller_device_id", deviceId)
+                    put("auth_token", cloudAuthToken)
+                    put("encrypted_key_a", encryptedBlob)
+                    put("encrypted_key_b", encryptedBlob)
                     put("key_fingerprint", fingerprint)
                     put("paired_via", pairedVia)
                 })
@@ -183,18 +186,28 @@ class ConvexBridge(
         return fingerprint
     }
 
-    fun loadSessionFromCloud(peerDeviceId: String): Boolean {
+    fun loadSessionFromCloud(peerDeviceId: String, pairSecretB64: String?): Boolean {
+        if (pairSecretB64.isNullOrBlank()) {
+            logCloud("Session load skipped for ${peerDeviceId.take(8)}…: missing pair secret")
+            return false
+        }
         return try {
             val data = query("sessions:getSession", JSONObject().apply {
                 put("my_device_id", deviceId)
                 put("peer_device_id", peerDeviceId)
+                put("auth_token", cloudAuthToken)
             }) ?: return false
 
             val blobJson = JSONObject(
                 String(Base64.decode(data.getString("encrypted_key"), Base64.NO_WRAP))
             )
+            val wrapKey = hkdf(
+                Base64.decode(pairSecretB64, Base64.NO_WRAP),
+                "ccp-session-wrap-v1".toByteArray(),
+                32
+            )
             val sessionKey = decryptAesGcm(
-                machineSecret,
+                wrapKey,
                 blobJson.getString("nonce"),
                 blobJson.getString("ciphertext")
             )
@@ -218,13 +231,10 @@ class ConvexBridge(
         payload: JSONObject,
         ttlMs: Long? = null,
     ): Boolean {
-        var key = getSessionKey(peerDeviceId)
+        val key = getSessionKey(peerDeviceId)
         if (key == null) {
-            if (!loadSessionFromCloud(peerDeviceId)) {
-                logCloud("No session key for ${peerDeviceId.take(8)}… — pair first")
-                return false
-            }
-            key = getSessionKey(peerDeviceId) ?: return false
+            logCloud("No session key for ${peerDeviceId.take(8)}… — pair first")
+            return false
         }
 
         val plaintext = payload.toString().toByteArray(Charsets.UTF_8)
@@ -234,6 +244,7 @@ class ConvexBridge(
         return try {
             val args = JSONObject().apply {
                 put("sender_id", deviceId)
+                put("auth_token", cloudAuthToken)
                 put("recipient_id", peerDeviceId)
                 put("msg_type", msgType)
                 put("encrypted_payload", enc["ciphertext"])
@@ -250,10 +261,16 @@ class ConvexBridge(
         }
     }
 
+    fun ensureSessionKey(peerDeviceId: String, pairSecretB64: String?): Boolean {
+        if (getSessionKey(peerDeviceId) != null) return true
+        return loadSessionFromCloud(peerDeviceId, pairSecretB64)
+    }
+
     fun pollMessages(): List<ConvexMessage> {
         return try {
             val rawArray = queryArray("messages:pollMessages", JSONObject().apply {
                 put("recipient_id", deviceId)
+                put("auth_token", cloudAuthToken)
             }) ?: return emptyList()
 
             val results = mutableListOf<ConvexMessage>()
@@ -262,11 +279,7 @@ class ConvexBridge(
             for (i in 0 until rawArray.length()) {
                 val msg = rawArray.getJSONObject(i)
                 val senderId = msg.getString("sender_id")
-                var key = getSessionKey(senderId)
-                if (key == null) {
-                    loadSessionFromCloud(senderId)
-                    key = getSessionKey(senderId)
-                }
+                val key = getSessionKey(senderId)
                 if (key == null) {
                     logCloud("No key for sender ${senderId.take(8)}… — skipping")
                     continue
@@ -291,6 +304,8 @@ class ConvexBridge(
 
             if (toAck.isNotEmpty()) {
                 mutation("messages:ackMessages", JSONObject().apply {
+                    put("recipient_id", deviceId)
+                    put("auth_token", cloudAuthToken)
                     put("message_ids", JSONArray(toAck))
                 })
             }
@@ -302,19 +317,30 @@ class ConvexBridge(
     }
 
     fun getPeerPresence(peerDeviceId: String): JSONObject? = try {
-        query("presence:getPresence", JSONObject().put("device_id", peerDeviceId))
+        query("presence:getPresence", JSONObject()
+            .put("device_id", peerDeviceId)
+            .put("requester_device_id", deviceId)
+            .put("auth_token", cloudAuthToken))
     } catch (_: Exception) { null }
 
     fun listPairedPeers(): JSONArray? = try {
-        queryArray("sessions:listSessions", JSONObject().put("device_id", deviceId))
+        queryArray("sessions:listSessions", JSONObject()
+            .put("device_id", deviceId)
+            .put("auth_token", cloudAuthToken))
     } catch (_: Exception) { null }
 
     fun getPeerDeviceInfo(peerDeviceId: String): JSONObject? = try {
-        query("devices:getDevice", JSONObject().put("device_id", peerDeviceId))
+        query("devices:getDevice", JSONObject()
+            .put("device_id", peerDeviceId)
+            .put("requester_device_id", deviceId)
+            .put("auth_token", cloudAuthToken))
     } catch (_: Exception) { null }
 
     fun getPeerPublicKey(peerDeviceId: String): String? = try {
-        query("devices:getPublicKey", JSONObject().put("device_id", peerDeviceId))
+        query("devices:getPublicKey", JSONObject()
+            .put("device_id", peerDeviceId)
+            .put("requester_device_id", deviceId)
+            .put("auth_token", cloudAuthToken))
             ?.optString("public_key_b64")
     } catch (_: Exception) { null }
 
@@ -356,6 +382,7 @@ class ConvexBridge(
 
                 mutation("presence:heartbeat", JSONObject().apply {
                     put("device_id", deviceId)
+                    put("auth_token", cloudAuthToken)
                     put("ip_hint", ipHint)
                     put("tcp_port", CCP_TCP_PORT)
                 })
@@ -489,15 +516,13 @@ class ConvexBridge(
         return key
     }
 
-    private fun deriveMachineSecret(): ByteArray {
-        val factory = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-        val spec = javax.crypto.spec.PBEKeySpec(
-            deviceId.toCharArray(),
-            "ccp-machine-secret-v0".toByteArray(),
-            100_000,
-            256
-        )
-        return factory.generateSecret(spec).encoded
+    private fun getOrCreateCloudAuthToken(): String {
+        val stored = prefs.getString("cloud_auth_token", null)
+        if (stored != null) return stored
+        val token = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        val encoded = Base64.encodeToString(token, Base64.NO_WRAP)
+        prefs.edit().putString("cloud_auth_token", encoded).apply()
+        return encoded
     }
 
     private fun logCloud(msg: String) {

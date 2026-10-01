@@ -6,20 +6,20 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId "com.ccp.android"
-        minSdkVersion 26
-        targetSdkVersion 35
-        versionCode 1
-        versionName "0.2.0"
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        applicationId = "com.ccp.android"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "0.2.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildFeatures {
-        compose true
+        compose = true
     }
 
     composeOptions {
-        kotlinCompilerExtensionVersion '1.5.14'
+        kotlinCompilerExtensionVersion = '1.5.14'
     }
 
     compileOptions {
@@ -33,7 +33,7 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled false
+            minifyEnabled = false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }

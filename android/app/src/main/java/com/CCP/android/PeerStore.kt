@@ -23,10 +23,18 @@ class PeerStore(context: Context) {
 
     fun isTrusted(deviceId: String): Boolean = prefs.contains("peer.$deviceId")
 
-    fun trust(sender: JSONObject) {
+    fun pairSecret(deviceId: String): String? =
+        prefs.getString("peer_secret.$deviceId", null)
+
+    fun trust(sender: JSONObject, pairSecretB64: String? = null) {
+        val deviceId = sender.getString("device_id")
         prefs.edit()
-            .putString("peer.${sender.getString("device_id")}", sender.toString())
+            .putString("peer.$deviceId", sender.toString())
+            .apply {
+                if (!pairSecretB64.isNullOrBlank()) {
+                    putString("peer_secret.$deviceId", pairSecretB64)
+                }
+            }
             .apply()
     }
 }
-

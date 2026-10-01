@@ -45,7 +45,7 @@ public sealed class CcpNode : IDisposable
         _onEvent = onEvent;
         _confirm = confirm;
 
-        Convex = new ConvexService(_config.DeviceId, _config.DeviceName, _config.PrivateKey);
+        Convex = new ConvexService(_config.DeviceId, _config.DeviceName, _config.PrivateKey, _config.CloudAuthToken);
         Convex.SetLogger(msg => _onEvent(msg));
         Convex.OnMessageReceived += HandleCloudMessage;
     }
@@ -69,20 +69,23 @@ public sealed class CcpNode : IDisposable
     public async Task PairAsync(PeerView peer)
     {
         var code = Random.Shared.Next(0, 999999).ToString("000000");
+        var pairSecret = GeneratePairSecret();
         _onEvent($"Pair request sent to {peer.DeviceName}. Code {code}");
         var response = await SendSingleAsync(peer, Envelope("pair.request", new()
         {
             ["pair_code"] = code,
             // Include our public key so the peer can complete ECDH immediately
             ["public_key"] = Convex.PublicKeyB64,
+            ["pair_secret"] = pairSecret,
         }));
         if (response is not null && response.Payload.TryGetValue("accepted", out var accepted) && AsBool(accepted))
         {
-            _config.Trust(new SenderInfo(peer.DeviceId, peer.DeviceName, peer.Platform));
+            var acceptedSecret = AsString(response.Payload.GetValueOrDefault("pair_secret")) ?? pairSecret;
+            _config.Trust(new SenderInfo(peer.DeviceId, peer.DeviceName, peer.Platform), acceptedSecret);
             UpsertPeer(peer with { Trusted = true, LastSeen = DateTime.Now });
             _onEvent($"Paired with {peer.DeviceName}");
             // Trigger cloud key exchange in background
-            _ = Task.Run(() => DeferredKeyExchangeAsync(peer.DeviceId));
+            _ = Task.Run(() => DeferredKeyExchangeAsync(peer.DeviceId, acceptedSecret));
         }
         else
         {
@@ -90,15 +93,17 @@ public sealed class CcpNode : IDisposable
         }
     }
 
-    private async Task DeferredKeyExchangeAsync(string peerDeviceId)
+    private async Task DeferredKeyExchangeAsync(string peerDeviceId, string? pairSecretB64 = null)
     {
+        pairSecretB64 ??= _config.PairSecret(peerDeviceId);
         for (int attempt = 0; attempt < 5; attempt++)
         {
             await Task.Delay(1000 * (1 << attempt));
             var pubKey = await Convex.GetPeerPublicKeyAsync(peerDeviceId);
             if (pubKey is not null)
             {
-                var fp = await Convex.CompleteKeyExchangeAsync(peerDeviceId, pubKey, "wifi");
+                var fp = await Convex.CompleteKeyExchangeAsync(peerDeviceId, pubKey, pairSecretB64, "wifi");
+                if (string.IsNullOrWhiteSpace(fp)) return;
                 _onEvent($"Cloud key exchange OK for {peerDeviceId[..8]}… (fp: {fp[..12]}…)");
                 return;
             }
@@ -284,8 +289,12 @@ public sealed class CcpNode : IDisposable
                 var name = info?.Name ?? $"Cloud device {deviceId[..8]}…";
                 var platform = info?.Platform ?? "unknown";
 
-                // Ensure we have the session key loaded
-                await Convex.LoadSessionFromCloudAsync(deviceId);
+                var pairSecret = _config.PairSecret(deviceId);
+                if (!await Convex.EnsureSessionKeyAsync(deviceId, pairSecret))
+                {
+                    _onEvent($"Cloud peer {deviceId[..8]} needs re-pairing before relay can be used.");
+                    continue;
+                }
 
                 UpsertPeer(new PeerView
                 {
@@ -596,6 +605,7 @@ public sealed class CcpNode : IDisposable
         FileStream? output = null;
         string? target = null;
         string? expectedHash = null;
+        var expectedChunkIndex = 0;
 
         try
         {
@@ -607,26 +617,33 @@ public sealed class CcpNode : IDisposable
                 {
                     case "pair.request":
                         var code = AsString(message.Payload.GetValueOrDefault("pair_code")) ?? "??????";
+                        var pairSecret = AsString(message.Payload.GetValueOrDefault("pair_secret")) ?? GeneratePairSecret();
                         var accepted = _confirm("CCP Pairing Request", $"Pair with {message.Sender.DeviceName} ({message.Sender.Platform})?\nPair code: {code}");
                         if (accepted)
                         {
-                            _config.Trust(message.Sender);
+                            _config.Trust(message.Sender, pairSecret);
                             // Key exchange: use public key from pair packet if present
                             var peerPubKey = AsString(message.Payload.GetValueOrDefault("public_key"));
                             if (!string.IsNullOrEmpty(peerPubKey) && peerPubKey != "reserved-for-v1")
                             {
                                 _ = Task.Run(async () =>
                                 {
-                                    var fp = await Convex.CompleteKeyExchangeAsync(message.Sender.DeviceId, peerPubKey, "wifi");
+                                    var fp = await Convex.CompleteKeyExchangeAsync(message.Sender.DeviceId, peerPubKey, pairSecret, "wifi");
+                                    if (string.IsNullOrWhiteSpace(fp)) return;
                                     _onEvent($"Cloud key exchange with {message.Sender.DeviceName} complete (fp: {fp[..12]}…)");
                                 });
                             }
                             else
                             {
-                                _ = Task.Run(() => DeferredKeyExchangeAsync(message.Sender.DeviceId));
+                                _ = Task.Run(() => DeferredKeyExchangeAsync(message.Sender.DeviceId, pairSecret));
                             }
                         }
-                        await WriteAsync(writer, Envelope("pair.response", new() { ["accepted"] = accepted, ["reason"] = accepted ? null : "rejected" }));
+                        await WriteAsync(writer, Envelope("pair.response", new()
+                        {
+                            ["accepted"] = accepted,
+                            ["pair_secret"] = accepted ? pairSecret : null,
+                            ["reason"] = accepted ? null : "rejected"
+                        }));
                         _onEvent(accepted ? $"Trusted {message.Sender.DeviceName}" : $"Rejected pair request from {message.Sender.DeviceName}");
                         break;
 
@@ -658,16 +675,20 @@ public sealed class CcpNode : IDisposable
                         if (allow)
                         {
                             output = File.Create(target);
+                            expectedChunkIndex = 0;
                             _onEvent($"Receiving {filename}");
                         }
                         break;
 
                     case "file.chunk":
                         if (output is null) break;
+                        var index = AsInt(message.Payload.GetValueOrDefault("index"), -1);
+                        if (index != expectedChunkIndex) throw new InvalidDataException($"Unexpected chunk index {index}; expected {expectedChunkIndex}");
                         var raw = Convert.FromBase64String(AsString(message.Payload.GetValueOrDefault("data_b64")) ?? "");
                         if (Sha256Bytes(raw) != AsString(message.Payload.GetValueOrDefault("sha256"))) throw new InvalidDataException("Chunk checksum mismatch");
                         await output.WriteAsync(raw, token);
-                        _onEvent($"Received chunk {message.Payload.GetValueOrDefault("index")}");
+                        expectedChunkIndex++;
+                        _onEvent($"Received chunk {index}");
                         break;
 
                     case "file.complete":
@@ -686,22 +707,26 @@ public sealed class CcpNode : IDisposable
                         break;
 
                     case "device.snapshot.request":
+                        if (!await RejectUntrustedAsync(writer, message, "device.snapshot.response")) break;
                         await WriteAsync(writer, Envelope("device.snapshot.response", BuildLocalSnapshotPayload()));
                         break;
 
                     case "gallery.list.request":
+                        if (!await RejectUntrustedAsync(writer, message, "gallery.list.response")) break;
                         await WriteAsync(writer, Envelope("gallery.list.response", BuildDirectoryPayload(
                             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures)),
                             "gallery")));
                         break;
 
                     case "files.list.request":
+                        if (!await RejectUntrustedAsync(writer, message, "files.list.response")) break;
                         await WriteAsync(writer, Envelope("files.list.response", BuildDirectoryPayload(
                             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"),
                             "file")));
                         break;
 
                     case "notifications.list.request":
+                        if (!await RejectUntrustedAsync(writer, message, "notifications.list.response")) break;
                         await WriteAsync(writer, Envelope("notifications.list.response", new()
                         {
                             ["permission_granted"] = false,
@@ -710,6 +735,7 @@ public sealed class CcpNode : IDisposable
                         break;
 
                     case "remote.action.request":
+                        if (!await RejectUntrustedAsync(writer, message, "remote.action.response")) break;
                         await WriteAsync(writer, Envelope("remote.action.response", new()
                         {
                             ["ok"] = false,
@@ -797,6 +823,21 @@ public sealed class CcpNode : IDisposable
     private static async Task WriteAsync(StreamWriter writer, CcpMessage message)
     {
         await writer.WriteLineAsync(JsonSerializer.Serialize(message));
+    }
+
+    private async Task<bool> RejectUntrustedAsync(StreamWriter writer, CcpMessage message, string responseType)
+    {
+        if (_config.IsTrusted(message.Sender.DeviceId)) return true;
+
+        await WriteAsync(writer, Envelope(responseType, new()
+        {
+            ["ok"] = false,
+            ["accepted"] = false,
+            ["message"] = "peer is not paired",
+            ["reason"] = "peer is not paired",
+        }));
+        _onEvent($"Rejected {message.Type} from unpaired device {message.Sender.DeviceName}");
+        return false;
     }
 
     private static async Task<CcpMessage?> ReadAsync(StreamReader reader)
@@ -1035,6 +1076,19 @@ public sealed class CcpNode : IDisposable
         };
     }
 
+    private static int AsInt(object? value, int fallback = 0)
+    {
+        return value switch
+        {
+            int i => i,
+            long l => checked((int)l),
+            JsonElement e when e.ValueKind == JsonValueKind.Number && e.TryGetInt32(out var i) => i,
+            JsonElement e when e.ValueKind == JsonValueKind.String && int.TryParse(e.GetString(), out var i) => i,
+            string s when int.TryParse(s, out var i) => i,
+            _ => fallback,
+        };
+    }
+
     private static IReadOnlyList<RemoteFactView> ParseFacts(object? value)
     {
         var result = new List<RemoteFactView>();
@@ -1097,6 +1151,8 @@ public sealed class CcpNode : IDisposable
     }
 
     private static string Sha256Bytes(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+    private static string GeneratePairSecret() => Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
 
     private static async Task<string> Sha256FileAsync(string path)
     {
@@ -1202,6 +1258,13 @@ public sealed class CcpNode : IDisposable
     {
         var senderShort = senderId[..Math.Min(8, senderId.Length)];
         var requestId = payload["request_id"]?.GetValue<string>();
+
+        if (RequiresTrustedPeer(msgType) && !_config.IsTrusted(senderId))
+        {
+            _onEvent($"[Cloud] Rejected {msgType} from unpaired device {senderShort}");
+            _ = Task.Run(() => SendCloudRejectionAsync(senderId, msgType, requestId));
+            return;
+        }
 
         switch (msgType)
         {
@@ -1348,8 +1411,15 @@ public sealed class CcpNode : IDisposable
                 transfer.Lock.Wait();
                 try
                 {
+                    var index = payload["index"]?.GetValue<int>() ?? -1;
+                    if (index != transfer.NextIndex)
+                    {
+                        _onEvent($"[Cloud] Unexpected chunk {index} for {Path.GetFileName(transfer.TargetPath)}; expected {transfer.NextIndex}");
+                        break;
+                    }
                     transfer.Output.Write(raw);
-                    _onEvent($"[Cloud] Received chunk {payload["index"]?.ToString() ?? "?"}");
+                    transfer.NextIndex++;
+                    _onEvent($"[Cloud] Received chunk {index}");
                 }
                 finally
                 {
@@ -1419,6 +1489,43 @@ public sealed class CcpNode : IDisposable
 
     // ── JsonNode-based parsers for cloud responses ─────────────────────────
 
+    private static bool RequiresTrustedPeer(string msgType) => msgType is
+        "device.snapshot.request" or
+        "gallery.list.request" or
+        "files.list.request" or
+        "notifications.list.request" or
+        "remote.action.request" or
+        "file.offer" or
+        "file.chunk" or
+        "file.complete" or
+        "clipboard.sync" or
+        "notification.push";
+
+    private static string ResponseTypeFor(string msgType) => msgType switch
+    {
+        "device.snapshot.request" => "device.snapshot.response",
+        "gallery.list.request" => "gallery.list.response",
+        "files.list.request" => "files.list.response",
+        "notifications.list.request" => "notifications.list.response",
+        "remote.action.request" => "remote.action.response",
+        "file.offer" => "file.offer.response",
+        "file.complete" => "file.complete.response",
+        _ => $"{msgType}.response",
+    };
+
+    private async Task SendCloudRejectionAsync(string peerDeviceId, string msgType, string? requestId)
+    {
+        var response = new JsonObject
+        {
+            ["ok"] = false,
+            ["accepted"] = false,
+            ["message"] = "peer is not paired",
+            ["reason"] = "peer is not paired",
+        };
+        if (requestId is not null) response["request_id"] = requestId;
+        await Convex.PushMessageAsync(peerDeviceId, ResponseTypeFor(msgType), response);
+    }
+
     private static IReadOnlyList<RemoteFactView> ParseJsonNodeFacts(JsonNode? node)
     {
         var result = new List<RemoteFactView>();
@@ -1486,5 +1593,6 @@ public sealed class CcpNode : IDisposable
         FileStream Output)
     {
         public SemaphoreSlim Lock { get; } = new(1, 1);
+        public int NextIndex { get; set; }
     }
 }

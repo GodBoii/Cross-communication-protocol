@@ -13,12 +13,14 @@ import android.provider.OpenableColumns
 import android.telecom.TelecomManager
 import android.util.Base64
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -38,12 +40,21 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
+data class PendingPairRequest(
+    val deviceId: String,
+    val deviceName: String,
+    val platform: String,
+    val pairCode: String,
+)
+
 class CcpNode(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val store = PeerStore(context)
     private val deviceData = DeviceDataRepository(context)
     private val peersById = linkedMapOf<String, DeviceInfo>()
+    private val peerLock = Any()
     private val cloudIncomingTransfers = ConcurrentHashMap<String, CloudIncomingTransfer>()
+    private val pendingPairApprovals = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     @Volatile private var running = false
     private var multicastLock: WifiManager.MulticastLock? = null
 
@@ -78,6 +89,19 @@ class CcpNode(private val context: Context) {
 
     private val _preferredTransports = MutableStateFlow<Map<String, String>>(emptyMap())
     val preferredTransports: StateFlow<Map<String, String>> = _preferredTransports
+
+    private val _pendingPairRequest = MutableStateFlow<PendingPairRequest?>(null)
+    val pendingPairRequest: StateFlow<PendingPairRequest?> = _pendingPairRequest
+
+    fun approvePendingPair(deviceId: String) {
+        pendingPairApprovals.remove(deviceId)?.complete(true)
+        _pendingPairRequest.value = null
+    }
+
+    fun rejectPendingPair(deviceId: String) {
+        pendingPairApprovals.remove(deviceId)?.complete(false)
+        _pendingPairRequest.value = null
+    }
 
     fun start() {
         if (running) return
@@ -117,23 +141,28 @@ class CcpNode(private val context: Context) {
     fun pair(peer: DeviceInfo) {
         scope.launch {
             val code = Random.nextInt(0, 999999).toString().padStart(6, '0')
+            val pairSecret = generatePairSecret()
             log("Pair request sent to ${peer.deviceName}. Code $code")
             val response = sendSingle(
                 peer,
                 ccpEnvelope("pair.request", store.sender(), JSONObject()
                     .put("pair_code", code)
-                    // Include our X25519 public key so peer can do key exchange immediately
-                    .put("public_key", convexBridge.publicKeyB64))
+                    .put("public_key", convexBridge.publicKeyB64)
+                    .put("pair_secret", pairSecret))
             )
             if (response?.optJSONObject("payload")?.optBoolean("accepted") == true) {
+                val acceptedSecret = response.optJSONObject("payload")
+                    ?.optString("pair_secret")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: pairSecret
                 store.trust(JSONObject()
                     .put("device_id", peer.deviceId)
                     .put("device_name", peer.deviceName)
-                    .put("platform", peer.platform))
+                    .put("platform", peer.platform), acceptedSecret)
                 updatePeer(peer.copy(trusted = true))
                 log("Paired with ${peer.deviceName}")
                 // Trigger cloud key exchange after successful WiFi pairing
-                scope.launch { deferredKeyExchange(peer.deviceId) }
+                scope.launch { deferredKeyExchange(peer.deviceId, acceptedSecret) }
             } else {
                 log("Pairing rejected by ${peer.deviceName}")
             }
@@ -141,12 +170,12 @@ class CcpNode(private val context: Context) {
     }
 
     /** Fetch peer's public key from Convex and complete key exchange. */
-    private suspend fun deferredKeyExchange(peerDeviceId: String) {
+    private suspend fun deferredKeyExchange(peerDeviceId: String, pairSecretB64: String? = store.pairSecret(peerDeviceId)) {
         repeat(5) { attempt ->
             kotlinx.coroutines.delay(1000L * (1 shl attempt))
             val pubKey = convexBridge.getPeerPublicKey(peerDeviceId)
             if (pubKey != null) {
-                val fp = convexBridge.completeKeyExchange(peerDeviceId, pubKey, "wifi")
+                val fp = convexBridge.completeKeyExchange(peerDeviceId, pubKey, pairSecretB64, "wifi")
                 log("Cloud key exchange OK for ${peerDeviceId.take(8)}… (fp: ${fp.take(12)}…)")
                 return
             }
@@ -401,7 +430,7 @@ class CcpNode(private val context: Context) {
         }
     }
 
-    private fun handleClient(socket: Socket) {
+    private suspend fun handleClient(socket: Socket) {
         socket.use {
             it.tcpNoDelay = true
             val reader = BufferedReader(InputStreamReader(it.getInputStream()))
@@ -409,6 +438,7 @@ class CcpNode(private val context: Context) {
             var activeFile: File? = null
             var activeOutput: FileOutputStream? = null
             var expectedHash: String? = null
+            var expectedChunkIndex = 0
             try {
                 while (true) {
                     val line = reader.readLine() ?: break
@@ -416,21 +446,39 @@ class CcpNode(private val context: Context) {
                     val sender = message.getJSONObject("sender")
                     when (message.optString("type")) {
                         "pair.request" -> {
-                            store.trust(sender)
-                            write(writer, ccpEnvelope("pair.response", store.sender(), JSONObject()
-                                .put("accepted", true)
-                                .put("reason", JSONObject.NULL)))
-                            log("Accepted pair request from ${sender.optString("device_name")}")
-                            // Perform cloud key exchange using the public key from the pair packet
-                            val peerPubKey = message.optJSONObject("payload")?.optString("public_key") ?: ""
+                            val payload = message.optJSONObject("payload") ?: JSONObject()
                             val peerDeviceId = sender.getString("device_id")
-                            if (peerPubKey.isNotBlank() && peerPubKey != "reserved-for-v1") {
+                            val pairSecret = payload.optString("pair_secret")
+                                .takeIf { it.isNotBlank() }
+                                ?: generatePairSecret()
+                            val accepted = store.isTrusted(peerDeviceId) || requestPairApproval(
+                                sender = sender,
+                                pairCode = payload.optString("pair_code", "??????"),
+                            )
+                            if (accepted) {
+                                store.trust(sender, pairSecret)
+                                updatePeer(DeviceInfo(
+                                    deviceId = peerDeviceId,
+                                    deviceName = sender.optString("device_name", "Unknown"),
+                                    platform = sender.optString("platform", "unknown"),
+                                    host = socket.inetAddress.hostAddress ?: "",
+                                    tcpPort = CCP_TCP_PORT,
+                                    trusted = true,
+                                ))
+                            }
+                            write(writer, ccpEnvelope("pair.response", store.sender(), JSONObject()
+                                .put("accepted", accepted)
+                                .put("pair_secret", if (accepted) pairSecret else JSONObject.NULL)
+                                .put("reason", if (accepted) JSONObject.NULL else "rejected")))
+                            log(if (accepted) "Accepted pair request from ${sender.optString("device_name")}" else "Rejected pair request from ${sender.optString("device_name")}")
+                            val peerPubKey = payload.optString("public_key")
+                            if (accepted && peerPubKey.isNotBlank() && peerPubKey != "reserved-for-v1") {
                                 scope.launch {
-                                    convexBridge.completeKeyExchange(peerDeviceId, peerPubKey, "wifi")
+                                    convexBridge.completeKeyExchange(peerDeviceId, peerPubKey, pairSecret, "wifi")
                                     log("Cloud key exchange with ${sender.optString("device_name")} complete")
                                 }
-                            } else {
-                                scope.launch { deferredKeyExchange(peerDeviceId) }
+                            } else if (accepted) {
+                                scope.launch { deferredKeyExchange(peerDeviceId, pairSecret) }
                             }
                         }
                         "file.offer" -> {
@@ -447,6 +495,7 @@ class CcpNode(private val context: Context) {
                                 activeFile = uniqueFile(inbox, safeFilename(payload.optString("filename", "received-file")))
                                 expectedHash = payload.optString("sha256")
                                 activeOutput = FileOutputStream(activeFile, false)
+                                expectedChunkIndex = 0
                                 write(writer, ccpEnvelope("file.offer.response", store.sender(), JSONObject()
                                     .put("transfer_id", payload.optString("transfer_id"))
                                     .put("accepted", true)
@@ -457,10 +506,13 @@ class CcpNode(private val context: Context) {
                         }
                         "file.chunk" -> {
                             val payload = message.getJSONObject("payload")
+                            val index = payload.optInt("index", -1)
+                            if (index != expectedChunkIndex) error("Unexpected chunk index $index; expected $expectedChunkIndex")
                             val chunk = Base64.decode(payload.getString("data_b64"), Base64.NO_WRAP)
                             if (sha256Hex(chunk) != payload.getString("sha256")) error("Chunk checksum mismatch")
                             activeOutput?.write(chunk)
-                            log("Received chunk ${payload.optInt("index")}")
+                            expectedChunkIndex++
+                            log("Received chunk $index")
                         }
                         "file.complete" -> {
                             activeOutput?.close()
@@ -479,21 +531,51 @@ class CcpNode(private val context: Context) {
                             log(if (ok) "Received and verified ${activeFile?.name}" else "Received file checksum failed")
                         }
                         "device.snapshot.request" -> {
+                            if (!store.isTrusted(sender.getString("device_id"))) {
+                                write(writer, ccpEnvelope("device.snapshot.response", store.sender(), JSONObject()
+                                    .put("ok", false)
+                                    .put("error", "peer is not paired")))
+                                continue
+                            }
                             write(writer, ccpEnvelope("device.snapshot.response", store.sender(), deviceData.buildRemoteSnapshotPayload(
                                 notificationAccessEnabled = NotificationCache.hasAccess(context),
                                 galleryAccessEnabled = deviceData.hasGalleryAccess()
                             )))
                         }
                         "gallery.list.request" -> {
+                            if (!store.isTrusted(sender.getString("device_id"))) {
+                                write(writer, ccpEnvelope("gallery.list.response", store.sender(), JSONObject()
+                                    .put("ok", false)
+                                    .put("error", "peer is not paired")))
+                                continue
+                            }
                             write(writer, ccpEnvelope("gallery.list.response", store.sender(), deviceData.buildGalleryPayload()))
                         }
                         "files.list.request" -> {
+                            if (!store.isTrusted(sender.getString("device_id"))) {
+                                write(writer, ccpEnvelope("files.list.response", store.sender(), JSONObject()
+                                    .put("ok", false)
+                                    .put("error", "peer is not paired")))
+                                continue
+                            }
                             write(writer, ccpEnvelope("files.list.response", store.sender(), deviceData.buildFilesPayload()))
                         }
                         "notifications.list.request" -> {
+                            if (!store.isTrusted(sender.getString("device_id"))) {
+                                write(writer, ccpEnvelope("notifications.list.response", store.sender(), JSONObject()
+                                    .put("ok", false)
+                                    .put("error", "peer is not paired")))
+                                continue
+                            }
                             write(writer, ccpEnvelope("notifications.list.response", store.sender(), deviceData.buildNotificationsPayload()))
                         }
                         "remote.action.request" -> {
+                            if (!store.isTrusted(sender.getString("device_id"))) {
+                                write(writer, ccpEnvelope("remote.action.response", store.sender(), JSONObject()
+                                    .put("ok", false)
+                                    .put("message", "peer is not paired")))
+                                continue
+                            }
                             val payload = message.getJSONObject("payload")
                             val action = payload.optString("action")
                             val args = payload.optJSONObject("args") ?: JSONObject()
@@ -557,8 +639,10 @@ class CcpNode(private val context: Context) {
     }
 
     private fun updatePeer(peer: DeviceInfo) {
-        peersById[peer.deviceId] = peer.copy(lastSeen = System.currentTimeMillis())
-        _peers.value = peersById.values.sortedByDescending { it.lastSeen }
+        synchronized(peerLock) {
+            peersById[peer.deviceId] = peer.copy(lastSeen = System.currentTimeMillis())
+            _peers.value = peersById.values.sortedByDescending { it.lastSeen }
+        }
     }
 
     private suspend fun cloudPeerLoop() {
@@ -577,10 +661,14 @@ class CcpNode(private val context: Context) {
             val peerId = session.optString("peer_id")
             if (peerId.isBlank()) continue
 
-            val existing = peersById[peerId]
+            val existing = synchronized(peerLock) { peersById[peerId] }
             if (existing != null && !existing.isCloudPeer) continue
 
-            convexBridge.loadSessionFromCloud(peerId)
+            val pairSecret = store.pairSecret(peerId)
+            if (!convexBridge.ensureSessionKey(peerId, pairSecret)) {
+                log("Cloud peer ${peerId.take(8)}… needs re-pairing before Long Distance use")
+                continue
+            }
             val info = convexBridge.getPeerDeviceInfo(peerId)
             val presence = convexBridge.getPeerPresence(peerId)
             updatePeer(
@@ -604,17 +692,19 @@ class CcpNode(private val context: Context) {
 
     private fun pruneStalePeers() {
         val cutoff = System.currentTimeMillis() - 20_000
-        val iterator = peersById.iterator()
-        var changed = false
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (!entry.value.isCloudPeer && entry.value.lastSeen < cutoff) {
-                iterator.remove()
-                changed = true
+        synchronized(peerLock) {
+            val iterator = peersById.iterator()
+            var changed = false
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (!entry.value.isCloudPeer && entry.value.lastSeen < cutoff) {
+                    iterator.remove()
+                    changed = true
+                }
             }
-        }
-        if (changed) {
-            _peers.value = peersById.values.sortedByDescending { it.lastSeen }
+            if (changed) {
+                _peers.value = peersById.values.sortedByDescending { it.lastSeen }
+            }
         }
     }
 
@@ -660,6 +750,11 @@ class CcpNode(private val context: Context) {
     private fun handleConvexMessage(msg: ConvexMessage) {
         val senderShort = msg.senderId.take(8)
         val requestId = msg.payload.optString("request_id", "")
+        if (requiresTrustedPeer(msg.msgType) && !store.isTrusted(msg.senderId)) {
+            log("[Cloud] Rejected ${msg.msgType} from unpaired $senderShort…")
+            scope.launch { sendCloudRejection(msg.senderId, msg.msgType, requestId) }
+            return
+        }
 
         when (msg.msgType) {
             "device.snapshot.request" -> {
@@ -756,7 +851,13 @@ class CcpNode(private val context: Context) {
                     return
                 }
                 synchronized(transfer) {
+                    val index = msg.payload.optInt("index", -1)
+                    if (index != transfer.nextIndex) {
+                        log("[Cloud] Unexpected chunk $index for ${transfer.file.name}; expected ${transfer.nextIndex}")
+                        return
+                    }
                     transfer.output.write(chunk)
+                    transfer.nextIndex++
                 }
                 log("[Cloud] Received chunk ${msg.payload.optInt("index")}")
             }
@@ -807,6 +908,66 @@ class CcpNode(private val context: Context) {
                 log("[Cloud] ${msg.msgType} from $senderShort…")
             }
         }
+    }
+
+    private fun requiresTrustedPeer(msgType: String): Boolean {
+        return msgType in setOf(
+            "device.snapshot.request",
+            "gallery.list.request",
+            "files.list.request",
+            "notifications.list.request",
+            "remote.action.request",
+            "file.offer",
+            "file.chunk",
+            "file.complete",
+            "clipboard.sync",
+            "notification.push",
+        )
+    }
+
+    private fun responseTypeFor(msgType: String): String = when (msgType) {
+        "device.snapshot.request" -> "device.snapshot.response"
+        "gallery.list.request" -> "gallery.list.response"
+        "files.list.request" -> "files.list.response"
+        "notifications.list.request" -> "notifications.list.response"
+        "remote.action.request" -> "remote.action.response"
+        "file.offer" -> "file.offer.response"
+        "file.complete" -> "file.complete.response"
+        else -> "$msgType.response"
+    }
+
+    private fun sendCloudRejection(peerDeviceId: String, msgType: String, requestId: String) {
+        val response = JSONObject()
+            .put("ok", false)
+            .put("accepted", false)
+            .put("reason", "peer is not paired")
+            .put("message", "peer is not paired")
+        if (requestId.isNotBlank()) response.put("request_id", requestId)
+        convexBridge.pushMessage(peerDeviceId, responseTypeFor(msgType), response)
+    }
+
+    private suspend fun requestPairApproval(sender: JSONObject, pairCode: String): Boolean {
+        val deviceId = sender.getString("device_id")
+        pendingPairApprovals.remove(deviceId)?.complete(false)
+        val deferred = CompletableDeferred<Boolean>()
+        pendingPairApprovals[deviceId] = deferred
+        _pendingPairRequest.value = PendingPairRequest(
+            deviceId = deviceId,
+            deviceName = sender.optString("device_name", "Unknown"),
+            platform = sender.optString("platform", "unknown"),
+            pairCode = pairCode,
+        )
+        val accepted = withTimeoutOrNull(60_000) { deferred.await() } == true
+        pendingPairApprovals.remove(deviceId)
+        if (_pendingPairRequest.value?.deviceId == deviceId) {
+            _pendingPairRequest.value = null
+        }
+        return accepted
+    }
+
+    private fun generatePairSecret(): String {
+        val bytes = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
     fun refreshLocalData() {
@@ -1042,4 +1203,6 @@ private data class CloudIncomingTransfer(
     val file: File,
     val expectedHash: String,
     val output: FileOutputStream,
-)
+) {
+    var nextIndex: Int = 0
+}

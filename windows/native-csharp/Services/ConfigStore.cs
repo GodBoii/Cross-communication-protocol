@@ -17,10 +17,14 @@ public sealed class ConfigStore
         Directory.CreateDirectory(root);
         _path = Path.Combine(root, "config-windows-native.json");
         _config = TryLoad() ?? ConfigDocument.Create();
-        // Migrate: if loaded config is missing a private key, add one
+
         if (string.IsNullOrWhiteSpace(_config.PrivateKeyB64))
         {
             _config = _config with { PrivateKeyB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) };
+        }
+        if (string.IsNullOrWhiteSpace(_config.CloudAuthTokenB64))
+        {
+            _config = _config with { CloudAuthTokenB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) };
         }
         Save();
     }
@@ -34,7 +38,7 @@ public sealed class ConfigStore
         }
         catch
         {
-            return null; // Corrupt or old format — start fresh
+            return null;
         }
     }
 
@@ -42,14 +46,20 @@ public sealed class ConfigStore
     public string DeviceName => _config.DeviceName;
     public SenderInfo Sender => new(DeviceId, DeviceName, "windows");
 
-    /// <summary>32-byte random private key used for cloud key exchange.</summary>
     public byte[] PrivateKey => Convert.FromBase64String(_config.PrivateKeyB64);
+    public string CloudAuthToken => _config.CloudAuthTokenB64;
 
     public bool IsTrusted(string deviceId) => _config.TrustedPeers.ContainsKey(deviceId);
+    public string? PairSecret(string deviceId) =>
+        _config.PairSecrets.TryGetValue(deviceId, out var secret) ? secret : null;
 
-    public void Trust(SenderInfo sender)
+    public void Trust(SenderInfo sender, string? pairSecretB64 = null)
     {
         _config.TrustedPeers[sender.DeviceId] = sender;
+        if (!string.IsNullOrWhiteSpace(pairSecretB64))
+        {
+            _config.PairSecrets[sender.DeviceId] = pairSecretB64;
+        }
         Save();
     }
 
@@ -62,8 +72,10 @@ public sealed class ConfigStore
     {
         public required string DeviceId { get; init; }
         public required string DeviceName { get; init; }
-        public string PrivateKeyB64 { get; init; } = "";  // not required — migrated on load
+        public string PrivateKeyB64 { get; init; } = "";
+        public string CloudAuthTokenB64 { get; init; } = "";
         public Dictionary<string, SenderInfo> TrustedPeers { get; init; } = [];
+        public Dictionary<string, string> PairSecrets { get; init; } = [];
 
         public static ConfigDocument Create()
         {
@@ -74,6 +86,7 @@ public sealed class ConfigStore
                 DeviceId = hash,
                 DeviceName = $"{Environment.MachineName} Windows",
                 PrivateKeyB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)),
+                CloudAuthTokenB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)),
             };
         }
     }

@@ -4,6 +4,26 @@ import { v } from "convex/values";
 /** Heartbeat interval after which a device is considered offline: 30 seconds */
 const OFFLINE_THRESHOLD_MS = 30_000;
 
+async function sha256Hex(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function requireDeviceAuth(ctx: any, deviceId: string, authToken: string) {
+  if (!authToken) throw new Error("auth_required");
+  const device = await ctx.db
+    .query("devices")
+    .withIndex("by_device_id", (q: any) => q.eq("device_id", deviceId))
+    .first();
+  if (!device?.auth_token_hash) throw new Error("device_not_registered");
+  if ((await sha256Hex(authToken)) !== device.auth_token_hash) {
+    throw new Error("auth_failed");
+  }
+}
+
 /**
  * Upsert a presence heartbeat for a device.
  * Each device should call this every ~10 seconds while running.
@@ -16,10 +36,12 @@ const OFFLINE_THRESHOLD_MS = 30_000;
 export const heartbeat = mutation({
   args: {
     device_id: v.string(),
+    auth_token: v.string(),
     ip_hint: v.string(),       // e.g. "192.168.x.x" or blank
     tcp_port: v.number(),
   },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.device_id, args.auth_token);
     const now = Date.now();
     const existing = await ctx.db
       .query("presence")
@@ -51,8 +73,9 @@ export const heartbeat = mutation({
  * Mark a device as offline (called on clean shutdown).
  */
 export const goOffline = mutation({
-  args: { device_id: v.string() },
+  args: { device_id: v.string(), auth_token: v.string() },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.device_id, args.auth_token);
     const existing = await ctx.db
       .query("presence")
       .withIndex("by_device_id", (q) => q.eq("device_id", args.device_id))
@@ -70,8 +93,13 @@ export const goOffline = mutation({
  * Returns online=false if the last heartbeat is older than OFFLINE_THRESHOLD_MS.
  */
 export const getPresence = query({
-  args: { device_id: v.string() },
+  args: {
+    device_id: v.string(),
+    requester_device_id: v.string(),
+    auth_token: v.string(),
+  },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.requester_device_id, args.auth_token);
     const presence = await ctx.db
       .query("presence")
       .withIndex("by_device_id", (q) => q.eq("device_id", args.device_id))
@@ -96,8 +124,13 @@ export const getPresence = query({
  * Get presence for all devices in a list (bulk fetch for dashboard).
  */
 export const getBulkPresence = query({
-  args: { device_ids: v.array(v.string()) },
+  args: {
+    device_ids: v.array(v.string()),
+    requester_device_id: v.string(),
+    auth_token: v.string(),
+  },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.requester_device_id, args.auth_token);
     const now = Date.now();
     const results: Record<string, boolean> = {};
 

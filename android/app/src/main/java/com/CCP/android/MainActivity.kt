@@ -210,6 +210,7 @@ fun CcpScreen(
     val recentReceived by node.recentReceived.collectAsState()
     val remotePanel by node.remotePanel.collectAsState()
     val preferredTransports by node.preferredTransports.collectAsState()
+    val pendingPairRequest by node.pendingPairRequest.collectAsState()
     val cloudStatus by node.convexBridge.cloudStatus.collectAsState()
     val cloudMessages by node.convexBridge.cloudMessages.collectAsState()
     var selectedPeer by remember { mutableStateOf<DeviceInfo?>(null) }
@@ -270,6 +271,16 @@ fun CcpScreen(
             )
         }
 
+        AnimatedVisibility(pendingPairRequest != null, enter = fadeIn(tween(200))) {
+            pendingPairRequest?.let { request ->
+                PairApprovalCard(
+                    request = request,
+                    onApprove = { node.approvePendingPair(request.deviceId) },
+                    onReject = { node.rejectPendingPair(request.deviceId) }
+                )
+            }
+        }
+
         AnimatedVisibility(visible, enter = fadeIn(tween(350, 240))) {
             NearbyDevicesCard(
                 peers = peers,
@@ -298,6 +309,29 @@ fun CcpScreen(
 
         AnimatedVisibility(visible, enter = fadeIn(tween(350, 480))) {
             ActivityCard(events)
+        }
+    }
+}
+
+@Composable
+fun PairApprovalCard(
+    request: PendingPairRequest,
+    onApprove: () -> Unit,
+    onReject: () -> Unit
+) {
+    ObsidianCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Pairing request", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = TextPrim)
+            Text("${request.deviceName}  ${request.platform}", color = TextSec, fontSize = 13.sp)
+            Text("Code ${request.pairCode}", color = TextPrim, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onApprove, colors = ButtonDefaults.buttonColors(containerColor = AccentBrand, contentColor = Void), modifier = Modifier.height(38.dp)) {
+                    Text("Approve", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(onClick = onReject, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim), modifier = Modifier.height(38.dp)) {
+                    Text("Reject", fontSize = 13.sp)
+                }
+            }
         }
     }
 }

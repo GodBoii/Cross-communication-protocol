@@ -19,6 +19,7 @@ export default defineSchema({
     device_name: v.string(),         // human-readable label ("Prajwal's Windows PC")
     platform: v.string(),            // "windows" | "android" | "macos" | "linux"
     public_key_b64: v.string(),      // base64 X25519 / ECDH public key
+    auth_token_hash: v.optional(v.string()), // SHA-256 of the locally-held cloud auth token
     capabilities: v.array(v.string()), // ["file.transfer", "notifications.list", ...]
     last_seen: v.number(),           // unix timestamp (ms)
     app_version: v.string(),         // "0.2.0" etc.

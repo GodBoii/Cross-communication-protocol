@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Net.Http;
-using System.Net.Sockets;
 using System.Net.NetworkInformation;
 using System.Security.Cryptography;
 using System.Text;
@@ -9,17 +8,6 @@ using System.Text.Json.Nodes;
 
 namespace CCP.Windows.Services;
 
-/// <summary>
-/// CCP ↔ Convex cloud relay bridge for Windows (C# / .NET 8).
-///
-/// Uses only System.Security.Cryptography (built into .NET 8):
-///   • SHA-256 based pseudo-ECDH for key agreement
-///   • HKDF-SHA256 for key derivation
-///   • AES-256-GCM for encryption (AesGcm class)
-///   • PBKDF2 for machine secret
-///
-/// Convex is used as an encrypted mailbox — it never sees plaintext.
-/// </summary>
 public sealed class ConvexService : IDisposable
 {
     private const string ConvexUrl = "https://reminiscent-raven-475.convex.cloud";
@@ -30,45 +18,32 @@ public sealed class ConvexService : IDisposable
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private readonly string _deviceId;
     private readonly string _deviceName;
-    private readonly byte[] _privateKey;
     private readonly byte[] _publicKey;
-    private readonly byte[] _machineSecret;
-
-    // peer device_id → 32-byte AES session key
+    private readonly string _cloudAuthToken;
+    private readonly string _cloudAuthTokenHash;
     private readonly Dictionary<string, byte[]> _sessionKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _sessionLock = new(1, 1);
-
-    // Cloud request-response: request_id → pending completion
     private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonObject>> _pendingRequests = new();
 
     private CancellationTokenSource? _cts;
     private Action<string>? _logger;
 
     public string PublicKeyB64 { get; }
-    public string CloudStatus { get; private set; } = "Connecting…";
+    public string CloudStatus { get; private set; } = "Connecting...";
     public event Action<string>? OnCloudStatusChanged;
-    public event Action<string, string, JsonObject>? OnMessageReceived; // (senderId, msgType, payload)
+    public event Action<string, string, JsonObject>? OnMessageReceived;
 
-    public ConvexService(string deviceId, string deviceName, byte[] privateKey)
+    public ConvexService(string deviceId, string deviceName, byte[] privateKey, string cloudAuthToken)
     {
         _deviceId = deviceId;
         _deviceName = deviceName;
-        _privateKey = privateKey;
-
-        // Public key = SHA256(privateKey || "ccp-pub")
+        _cloudAuthToken = cloudAuthToken;
+        _cloudAuthTokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cloudAuthToken))).ToLowerInvariant();
         _publicKey = SHA256.HashData([.. privateKey, .. "ccp-pub"u8.ToArray()]);
         PublicKeyB64 = Convert.ToBase64String(_publicKey);
-
-        // Machine secret = PBKDF2(deviceId, "ccp-machine-secret-v0", 100000, 32)
-        _machineSecret = Rfc2898DeriveBytes.Pbkdf2(
-            Encoding.UTF8.GetBytes(deviceId),
-            "ccp-machine-secret-v0"u8.ToArray(),
-            100_000, HashAlgorithmName.SHA256, 32);
     }
 
     public void SetLogger(Action<string> logger) => _logger = logger;
-
-    // ── Lifecycle ──────────────────────────────────────────────────────────
 
     public void Start(string appVersion = "0.2.0")
     {
@@ -83,12 +58,12 @@ public sealed class ConvexService : IDisposable
         _cts?.Cancel();
         try
         {
-            await MutationAsync("presence:goOffline", new JsonObject { ["device_id"] = _deviceId });
+            await MutationAsync("presence:goOffline", AuthArgs(new JsonObject { ["device_id"] = _deviceId }));
         }
-        catch { /* best effort */ }
+        catch
+        {
+        }
     }
-
-    // ── Registration ───────────────────────────────────────────────────────
 
     private async Task RegisterAsync(string appVersion, CancellationToken ct)
     {
@@ -102,8 +77,9 @@ public sealed class ConvexService : IDisposable
                 ["public_key_b64"] = PublicKeyB64,
                 ["capabilities"] = new JsonArray("pairing", "file.transfer", "remote.action", "device.snapshot"),
                 ["app_version"] = appVersion,
+                ["auth_token_hash"] = _cloudAuthTokenHash,
             }, ct);
-            SetStatus("Cloud connected ✓");
+            SetStatus("Cloud connected");
             Log("Registered on Convex");
         }
         catch (Exception ex)
@@ -113,50 +89,46 @@ public sealed class ConvexService : IDisposable
         }
     }
 
-    // ── Key Exchange ───────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Call after a successful local WiFi pairing.
-    /// Derives a shared session key via pseudo-ECDH and stores encrypted blobs in Convex.
-    /// Returns the key fingerprint (hex SHA-256 of shared secret).
-    /// </summary>
-    public async Task<string> CompleteKeyExchangeAsync(string peerDeviceId, string peerPublicKeyB64, string pairedVia = "wifi")
+    public async Task<string> CompleteKeyExchangeAsync(
+        string peerDeviceId,
+        string peerPublicKeyB64,
+        string? pairSecretB64,
+        string pairedVia = "wifi")
     {
-        var peerPub = Convert.FromBase64String(peerPublicKeyB64);
+        if (string.IsNullOrWhiteSpace(pairSecretB64))
+        {
+            Log($"No pair secret for {Short(peerDeviceId)}; re-pair before using cloud relay");
+            return "";
+        }
 
-        // Pseudo-ECDH: sharedSecret = SHA256(myPrivate || peerPublic)
-        var sharedSecret = SHA256.HashData([.. _privateKey, .. peerPub]);
-        var sessionKey = HKDF.DeriveKey(HashAlgorithmName.SHA256, sharedSecret, 32, info: "ccp-session-v0"u8.ToArray());
-        var fingerprint = Convert.ToHexString(SHA256.HashData(sharedSecret)).ToLowerInvariant();
-
-        // Encrypt our copy with machine secret
-        var myBlob = Convert.ToBase64String(Encoding.UTF8.GetBytes(
-            JsonSerializer.Serialize(EncryptGcm(_machineSecret, sessionKey))));
-
-        // Encrypt peer copy with key derived from their device_id
-        var peerMachineSecret = HKDF.DeriveKey(HashAlgorithmName.SHA256,
-            Encoding.UTF8.GetBytes(peerDeviceId), 32, info: "ccp-machine-v0"u8.ToArray());
-        var peerBlob = Convert.ToBase64String(Encoding.UTF8.GetBytes(
-            JsonSerializer.Serialize(EncryptGcm(peerMachineSecret, sessionKey))));
-
+        var pairSecret = Convert.FromBase64String(pairSecretB64);
         var idA = string.Compare(_deviceId, peerDeviceId, StringComparison.Ordinal) < 0 ? _deviceId : peerDeviceId;
         var idB = string.Compare(_deviceId, peerDeviceId, StringComparison.Ordinal) < 0 ? peerDeviceId : _deviceId;
-        var encA = _deviceId == idA ? myBlob : peerBlob;
-        var encB = _deviceId == idA ? peerBlob : myBlob;
+        var context = Encoding.UTF8.GetBytes($"{idA}|{idB}");
+        var sessionInput = new byte[pairSecret.Length + context.Length];
+        Buffer.BlockCopy(pairSecret, 0, sessionInput, 0, pairSecret.Length);
+        Buffer.BlockCopy(context, 0, sessionInput, pairSecret.Length, context.Length);
+
+        var sessionKey = HKDF.DeriveKey(HashAlgorithmName.SHA256, sessionInput, 32, info: "ccp-session-v1"u8.ToArray());
+        var wrapKey = HKDF.DeriveKey(HashAlgorithmName.SHA256, pairSecret, 32, info: "ccp-session-wrap-v1"u8.ToArray());
+        var fingerprint = Convert.ToHexString(SHA256.HashData(sessionKey)).ToLowerInvariant();
+        var encryptedBlob = Convert.ToBase64String(Encoding.UTF8.GetBytes(
+            JsonSerializer.Serialize(EncryptGcm(wrapKey, sessionKey))));
 
         try
         {
-            await MutationAsync("sessions:storeSession", new JsonObject
+            await MutationAsync("sessions:storeSession", AuthArgs(new JsonObject
             {
                 ["device_id_a"] = idA,
                 ["device_id_b"] = idB,
-                ["encrypted_key_a"] = encA,
-                ["encrypted_key_b"] = encB,
+                ["encrypted_key_a"] = encryptedBlob,
+                ["encrypted_key_b"] = encryptedBlob,
                 ["key_fingerprint"] = fingerprint,
                 ["paired_via"] = pairedVia,
-            });
-            Log($"Session stored with {peerDeviceId[..8]}… (fp: {fingerprint[..12]}…)");
-            SetStatus("Cloud relay ready ✓");
+                ["caller_device_id"] = _deviceId,
+            }));
+            Log($"Session stored with {Short(peerDeviceId)} (fp: {Short(fingerprint, 12)})");
+            SetStatus("Cloud relay ready");
         }
         catch (Exception ex)
         {
@@ -170,20 +142,28 @@ public sealed class ConvexService : IDisposable
         return fingerprint;
     }
 
-    public async Task<bool> LoadSessionFromCloudAsync(string peerDeviceId)
+    public async Task<bool> LoadSessionFromCloudAsync(string peerDeviceId, string? pairSecretB64)
     {
+        if (string.IsNullOrWhiteSpace(pairSecretB64))
+        {
+            Log($"No pair secret for {Short(peerDeviceId)}; re-pair before using cloud relay");
+            return false;
+        }
+
         try
         {
-            var data = await QueryAsync("sessions:getSession", new JsonObject
+            var data = await QueryAsync("sessions:getSession", AuthArgs(new JsonObject
             {
                 ["my_device_id"] = _deviceId,
                 ["peer_device_id"] = peerDeviceId,
-            });
+            }));
             if (data is null) return false;
 
+            var wrapKey = HKDF.DeriveKey(HashAlgorithmName.SHA256,
+                Convert.FromBase64String(pairSecretB64), 32, info: "ccp-session-wrap-v1"u8.ToArray());
             var blobJson = JsonNode.Parse(
                 Encoding.UTF8.GetString(Convert.FromBase64String(data["encrypted_key"]!.GetValue<string>())))!.AsObject();
-            var sessionKey = DecryptGcm(_machineSecret,
+            var sessionKey = DecryptGcm(wrapKey,
                 blobJson["nonce"]!.GetValue<string>(),
                 blobJson["ciphertext"]!.GetValue<string>());
 
@@ -191,14 +171,20 @@ public sealed class ConvexService : IDisposable
             try { _sessionKeys[peerDeviceId] = sessionKey; }
             finally { _sessionLock.Release(); }
 
-            Log($"Session loaded for {peerDeviceId[..8]}…");
+            Log($"Session loaded for {Short(peerDeviceId)}");
             return true;
         }
         catch (Exception ex)
         {
-            Log($"Session load failed for {peerDeviceId[..8]}…: {ex.Message}");
+            Log($"Session load failed for {Short(peerDeviceId)}: {ex.Message}");
             return false;
         }
+    }
+
+    public async Task<bool> EnsureSessionKeyAsync(string peerDeviceId, string? pairSecretB64)
+    {
+        if (await GetSessionKeyAsync(peerDeviceId) is not null) return true;
+        return await LoadSessionFromCloudAsync(peerDeviceId, pairSecretB64);
     }
 
     public async Task<byte[]?> GetSessionKeyAsync(string peerDeviceId)
@@ -206,42 +192,36 @@ public sealed class ConvexService : IDisposable
         await _sessionLock.WaitAsync();
         try
         {
-            if (_sessionKeys.TryGetValue(peerDeviceId, out var key)) return key;
+            return _sessionKeys.TryGetValue(peerDeviceId, out var key) ? key : null;
         }
         finally { _sessionLock.Release(); }
-        return null;
     }
-
-    // ── Message Push / Poll ────────────────────────────────────────────────
 
     public async Task<bool> PushMessageAsync(string peerDeviceId, string msgType, JsonObject payload, long? ttlMs = null)
     {
         var key = await GetSessionKeyAsync(peerDeviceId);
         if (key is null)
         {
-            if (!await LoadSessionFromCloudAsync(peerDeviceId)) { Log($"No session for {peerDeviceId[..8]}… — pair first"); return false; }
-            key = await GetSessionKeyAsync(peerDeviceId);
-            if (key is null) return false;
+            Log($"No session for {Short(peerDeviceId)}; pair first");
+            return false;
         }
 
-        var plaintext = Encoding.UTF8.GetBytes(payload.ToJsonString());
-        var enc = EncryptGcm(key, plaintext);
-        var msgId = Guid.NewGuid().ToString();
+        var enc = EncryptGcm(key, Encoding.UTF8.GetBytes(payload.ToJsonString()));
+        var args = AuthArgs(new JsonObject
+        {
+            ["sender_id"] = _deviceId,
+            ["recipient_id"] = peerDeviceId,
+            ["msg_type"] = msgType,
+            ["encrypted_payload"] = enc["ciphertext"],
+            ["nonce"] = enc["nonce"],
+            ["msg_id"] = Guid.NewGuid().ToString(),
+        });
+        if (ttlMs.HasValue) args["ttl_ms"] = ttlMs.Value;
 
         try
         {
-            var args = new JsonObject
-            {
-                ["sender_id"] = _deviceId,
-                ["recipient_id"] = peerDeviceId,
-                ["msg_type"] = msgType,
-                ["encrypted_payload"] = enc["ciphertext"],
-                ["nonce"] = enc["nonce"],
-                ["msg_id"] = msgId,
-            };
-            if (ttlMs.HasValue) args["ttl_ms"] = ttlMs.Value;
             await MutationAsync("messages:pushMessage", args);
-            Log($"Pushed {msgType} → {peerDeviceId[..8]}…");
+            Log($"Pushed {msgType} to {Short(peerDeviceId)}");
             return true;
         }
         catch (Exception ex)
@@ -255,7 +235,11 @@ public sealed class ConvexService : IDisposable
     {
         try
         {
-            var data = await QueryAsync("devices:getPublicKey", new JsonObject { ["device_id"] = peerDeviceId });
+            var data = await QueryAsync("devices:getPublicKey", AuthArgs(new JsonObject
+            {
+                ["requester_device_id"] = _deviceId,
+                ["device_id"] = peerDeviceId,
+            }));
             return data?["public_key_b64"]?.GetValue<string>();
         }
         catch { return null; }
@@ -265,19 +249,21 @@ public sealed class ConvexService : IDisposable
     {
         try
         {
-            var data = await QueryAsync("presence:getPresence", new JsonObject { ["device_id"] = peerDeviceId });
+            var data = await QueryAsync("presence:getPresence", AuthArgs(new JsonObject
+            {
+                ["requester_device_id"] = _deviceId,
+                ["device_id"] = peerDeviceId,
+            }));
             return data?["online"]?.GetValue<bool>() ?? false;
         }
         catch { return false; }
     }
 
-    // ── Cloud Request-Response ─────────────────────────────────────────────
-
-    /// <summary>
-    /// Send a request via cloud relay and wait for a matching response.
-    /// The response must include the same request_id in its payload.
-    /// </summary>
-    public async Task<JsonObject?> SendCloudRequestAsync(string peerDeviceId, string msgType, JsonObject? extraPayload = null, int timeoutMs = 15_000)
+    public async Task<JsonObject?> SendCloudRequestAsync(
+        string peerDeviceId,
+        string msgType,
+        JsonObject? extraPayload = null,
+        int timeoutMs = 15_000)
     {
         var requestId = Guid.NewGuid().ToString();
         var payload = extraPayload ?? new JsonObject();
@@ -295,12 +281,12 @@ public sealed class ConvexService : IDisposable
             }
 
             using var cts = new CancellationTokenSource(timeoutMs);
-            cts.Token.Register(() => tcs.TrySetCanceled());
+            using var registration = cts.Token.Register(() => tcs.TrySetCanceled());
             return await tcs.Task;
         }
         catch (OperationCanceledException)
         {
-            Log($"Cloud request {msgType} to {peerDeviceId[..Math.Min(8, peerDeviceId.Length)]}… timed out");
+            Log($"Cloud request {msgType} to {Short(peerDeviceId)} timed out");
             return null;
         }
         finally
@@ -309,19 +295,15 @@ public sealed class ConvexService : IDisposable
         }
     }
 
-    // ── Cloud Peer Discovery ──────────────────────────────────────────────
-
-    /// <summary>
-    /// List all paired peers from Convex sessions, with their online status.
-    /// Used by Long Distance mode to show cloud-reachable devices.
-    /// </summary>
     public async Task<List<(string DeviceId, string KeyFingerprint, string PairedVia, bool Online)>> ListPairedPeersAsync()
     {
         var result = new List<(string, string, string, bool)>();
         try
         {
-            var sessionsArray = await QueryArrayAsync("sessions:listSessions",
-                new JsonObject { ["device_id"] = _deviceId });
+            var sessionsArray = await QueryArrayAsync("sessions:listSessions", AuthArgs(new JsonObject
+            {
+                ["device_id"] = _deviceId,
+            }));
             if (sessionsArray is null) return result;
 
             foreach (var item in sessionsArray)
@@ -329,7 +311,6 @@ public sealed class ConvexService : IDisposable
                 if (item is not JsonObject session) continue;
                 var peerId = session["peer_id"]?.GetValue<string>() ?? "";
                 if (string.IsNullOrWhiteSpace(peerId)) continue;
-
                 var online = await GetPeerOnlineAsync(peerId);
                 result.Add((
                     peerId,
@@ -346,14 +327,15 @@ public sealed class ConvexService : IDisposable
         return result;
     }
 
-    /// <summary>
-    /// Get device info (name, platform) for a remote peer from Convex.
-    /// </summary>
     public async Task<(string Name, string Platform, string AppVersion)?> GetPeerDeviceInfoAsync(string peerDeviceId)
     {
         try
         {
-            var data = await QueryAsync("devices:getDevice", new JsonObject { ["device_id"] = peerDeviceId });
+            var data = await QueryAsync("devices:getDevice", AuthArgs(new JsonObject
+            {
+                ["requester_device_id"] = _deviceId,
+                ["device_id"] = peerDeviceId,
+            }));
             if (data is null) return null;
             return (
                 data["device_name"]?.GetValue<string>() ?? "Unknown",
@@ -364,23 +346,22 @@ public sealed class ConvexService : IDisposable
         catch { return null; }
     }
 
-    // ── Background loops ───────────────────────────────────────────────────
-
     private async Task HeartbeatLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                var ipHint = GetLocalIpHint();
-                await MutationAsync("presence:heartbeat", new JsonObject
+                await MutationAsync("presence:heartbeat", AuthArgs(new JsonObject
                 {
                     ["device_id"] = _deviceId,
-                    ["ip_hint"] = ipHint,
+                    ["ip_hint"] = GetLocalIpHint(),
                     ["tcp_port"] = TcpPort,
-                }, ct);
+                }), ct);
             }
-            catch { /* offline — ignore */ }
+            catch
+            {
+            }
             await Task.Delay(HeartbeatIntervalMs, ct).ContinueWith(_ => { });
         }
     }
@@ -393,15 +374,19 @@ public sealed class ConvexService : IDisposable
             {
                 await PollAndDispatchAsync(ct);
             }
-            catch { /* ignore transient errors */ }
+            catch
+            {
+            }
             await Task.Delay(PollIntervalMs, ct).ContinueWith(_ => { });
         }
     }
 
     private async Task PollAndDispatchAsync(CancellationToken ct)
     {
-        var rawArray = await QueryArrayAsync("messages:pollMessages",
-            new JsonObject { ["recipient_id"] = _deviceId }, ct);
+        var rawArray = await QueryArrayAsync("messages:pollMessages", AuthArgs(new JsonObject
+        {
+            ["recipient_id"] = _deviceId,
+        }), ct);
         if (rawArray is null || rawArray.Count == 0) return;
 
         var toAck = new JsonArray();
@@ -418,27 +403,23 @@ public sealed class ConvexService : IDisposable
             var key = await GetSessionKeyAsync(senderId);
             if (key is null)
             {
-                await LoadSessionFromCloudAsync(senderId);
-                key = await GetSessionKeyAsync(senderId);
+                Log($"No key for {Short(senderId)}; skipping cloud message");
+                continue;
             }
-            if (key is null) { Log($"No key for {senderId[..Math.Min(8, senderId.Length)]}… — skipping"); continue; }
 
             try
             {
                 var plaintext = DecryptGcm(key, nonce, ciphertext);
                 var payload = JsonNode.Parse(Encoding.UTF8.GetString(plaintext))?.AsObject() ?? new JsonObject();
-
-                // Check if this is a response to a pending cloud request
                 var requestId = payload["request_id"]?.GetValue<string>();
                 if (requestId is not null && _pendingRequests.TryRemove(requestId, out var tcs))
                 {
-                    Log($"Cloud response {msgType} from {senderId[..Math.Min(8, senderId.Length)]}… (req: {requestId[..Math.Min(8, requestId.Length)]}…)");
+                    Log($"Cloud response {msgType} from {Short(senderId)}");
                     tcs.TrySetResult(payload);
                 }
                 else
                 {
-                    // Normal incoming message — dispatch to CcpNode handler
-                    Log($"Received {msgType} from {senderId[..Math.Min(8, senderId.Length)]}…");
+                    Log($"Received {msgType} from {Short(senderId)}");
                     OnMessageReceived?.Invoke(senderId, msgType, payload);
                 }
 
@@ -452,11 +433,13 @@ public sealed class ConvexService : IDisposable
 
         if (toAck.Count > 0)
         {
-            await MutationAsync("messages:ackMessages", new JsonObject { ["message_ids"] = toAck }, ct);
+            await MutationAsync("messages:ackMessages", AuthArgs(new JsonObject
+            {
+                ["recipient_id"] = _deviceId,
+                ["message_ids"] = toAck,
+            }), ct);
         }
     }
-
-    // ── Crypto helpers ─────────────────────────────────────────────────────
 
     private static Dictionary<string, string> EncryptGcm(byte[] key, byte[] plaintext)
     {
@@ -465,7 +448,6 @@ public sealed class ConvexService : IDisposable
         var tag = new byte[16];
         using var aes = new AesGcm(key, 16);
         aes.Encrypt(nonce, plaintext, ciphertext, tag);
-        // Append tag to ciphertext (matches Android/Python convention)
         var combined = new byte[ciphertext.Length + tag.Length];
         ciphertext.CopyTo(combined, 0);
         tag.CopyTo(combined, ciphertext.Length);
@@ -488,9 +470,11 @@ public sealed class ConvexService : IDisposable
         return plaintext;
     }
 
-    // ── HTTP helpers ───────────────────────────────────────────────────────
-
-    private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNamingPolicy = null };
+    private JsonObject AuthArgs(JsonObject args)
+    {
+        args["auth_token"] = _cloudAuthToken;
+        return args;
+    }
 
     private async Task<JsonObject?> MutationAsync(string func, JsonObject args, CancellationToken ct = default)
     {
@@ -508,9 +492,12 @@ public sealed class ConvexService : IDisposable
         var content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
         var response = await _http.PostAsync($"{ConvexUrl}/api/query", content, ct);
         var text = await response.Content.ReadAsStringAsync(ct);
-        if (!response.IsSuccessStatusCode) { Log($"HTTP {(int)response.StatusCode}: {text}"); return null; }
-        var node = JsonNode.Parse(text);
-        return node?["value"]?.AsArray();
+        if (!response.IsSuccessStatusCode)
+        {
+            Log($"HTTP {(int)response.StatusCode}: {text}");
+            return null;
+        }
+        return JsonNode.Parse(text)?["value"]?.AsArray();
     }
 
     private async Task<JsonObject?> PostConvexAsync(string endpoint, string func, JsonObject args, CancellationToken ct)
@@ -521,7 +508,11 @@ public sealed class ConvexService : IDisposable
         {
             var response = await _http.PostAsync($"{ConvexUrl}/api/{endpoint}", content, ct);
             var text = await response.Content.ReadAsStringAsync(ct);
-            if (!response.IsSuccessStatusCode) { Log($"HTTP {(int)response.StatusCode}: {text[..Math.Min(200, text.Length)]}"); return null; }
+            if (!response.IsSuccessStatusCode)
+            {
+                Log($"HTTP {(int)response.StatusCode}: {text[..Math.Min(200, text.Length)]}");
+                return null;
+            }
             return JsonNode.Parse(text)?["value"]?.AsObject();
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -530,8 +521,6 @@ public sealed class ConvexService : IDisposable
             return null;
         }
     }
-
-    // ── Utilities ──────────────────────────────────────────────────────────
 
     private static string GetLocalIpHint()
     {
@@ -550,6 +539,9 @@ public sealed class ConvexService : IDisposable
         }
         return "x.x.x.x";
     }
+
+    private static string Short(string value, int length = 8) =>
+        value[..Math.Min(length, value.Length)];
 
     private void SetStatus(string status)
     {

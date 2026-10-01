@@ -1,9 +1,28 @@
-import { mutation, query, action } from "./_generated/server";
+import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { api } from "./_generated/api";
 
 /** Default TTL for cloud relay messages: 48 hours */
 const DEFAULT_TTL_MS = 48 * 60 * 60 * 1000;
+
+async function sha256Hex(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function requireDeviceAuth(ctx: any, deviceId: string, authToken: string) {
+  if (!authToken) throw new Error("auth_required");
+  const device = await ctx.db
+    .query("devices")
+    .withIndex("by_device_id", (q: any) => q.eq("device_id", deviceId))
+    .first();
+  if (!device?.auth_token_hash) throw new Error("device_not_registered");
+  if ((await sha256Hex(authToken)) !== device.auth_token_hash) {
+    throw new Error("auth_failed");
+  }
+}
 
 /**
  * Push an encrypted message into the cloud relay queue.
@@ -25,6 +44,7 @@ const DEFAULT_TTL_MS = 48 * 60 * 60 * 1000;
 export const pushMessage = mutation({
   args: {
     sender_id: v.string(),
+    auth_token: v.string(),
     recipient_id: v.string(),
     msg_type: v.string(),
     encrypted_payload: v.string(),   // base64 AES-256-GCM ciphertext
@@ -33,6 +53,7 @@ export const pushMessage = mutation({
     ttl_ms: v.optional(v.number()),  // custom TTL; defaults to 48h
   },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.sender_id, args.auth_token);
     // Idempotency check: if a message with this msg_id already exists skip
     const duplicate = await ctx.db
       .query("messages")
@@ -69,9 +90,11 @@ export const pushMessage = mutation({
 export const pollMessages = query({
   args: {
     recipient_id: v.string(),
+    auth_token: v.string(),
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.recipient_id, args.auth_token);
     const now = Date.now();
     const limit = args.limit ?? 50;
 
@@ -105,13 +128,21 @@ export const pollMessages = query({
  */
 export const ackMessages = mutation({
   args: {
+    recipient_id: v.string(),
+    auth_token: v.string(),
     message_ids: v.array(v.id("messages")),
   },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.recipient_id, args.auth_token);
+    let acked = 0;
     for (const id of args.message_ids) {
-      await ctx.db.patch(id, { delivered: true });
+      const message = await ctx.db.get(id);
+      if (message && message.recipient_id === args.recipient_id) {
+        await ctx.db.patch(id, { delivered: true });
+        acked++;
+      }
     }
-    return { acked: args.message_ids.length };
+    return { acked };
   },
 });
 
@@ -142,8 +173,9 @@ export const purgeExpiredMessages = mutation({
  * Get pending message count for a device (useful for badge / status display).
  */
 export const pendingCount = query({
-  args: { recipient_id: v.string() },
+  args: { recipient_id: v.string(), auth_token: v.string() },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.recipient_id, args.auth_token);
     const now = Date.now();
     const msgs = await ctx.db
       .query("messages")

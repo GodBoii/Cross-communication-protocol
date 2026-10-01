@@ -1,6 +1,26 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
+async function sha256Hex(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function requireDeviceAuth(ctx: any, deviceId: string, authToken: string) {
+  if (!authToken) throw new Error("auth_required");
+  const device = await ctx.db
+    .query("devices")
+    .withIndex("by_device_id", (q: any) => q.eq("device_id", deviceId))
+    .first();
+  if (!device?.auth_token_hash) throw new Error("device_not_registered");
+  if ((await sha256Hex(authToken)) !== device.auth_token_hash) {
+    throw new Error("auth_failed");
+  }
+}
+
 /**
  * Canonical pair ordering helper — always store (smaller, larger) so a pair
  * maps to exactly one row regardless of who calls first.
@@ -35,6 +55,8 @@ export const storeSession = mutation({
   args: {
     device_id_a: v.string(),         // lexicographically smaller device_id
     device_id_b: v.string(),         // lexicographically larger device_id
+    caller_device_id: v.string(),
+    auth_token: v.string(),
     encrypted_key_a: v.string(),     // base64 blob for device_a
     encrypted_key_b: v.string(),     // base64 blob for device_b
     key_fingerprint: v.string(),     // SHA-256 of the raw shared secret
@@ -42,6 +64,10 @@ export const storeSession = mutation({
   },
   handler: async (ctx, args) => {
     const [id_a, id_b] = orderPair(args.device_id_a, args.device_id_b);
+    if (args.caller_device_id !== id_a && args.caller_device_id !== id_b) {
+      throw new Error("caller_not_in_pair");
+    }
+    await requireDeviceAuth(ctx, args.caller_device_id, args.auth_token);
 
     // Validate: ensure device_id_a < device_id_b in args too (caller may pass
     // either order; we normalise).
@@ -98,9 +124,11 @@ export const storeSession = mutation({
 export const getSession = query({
   args: {
     my_device_id: v.string(),
+    auth_token: v.string(),
     peer_device_id: v.string(),
   },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.my_device_id, args.auth_token);
     const [id_a, id_b] = orderPair(args.my_device_id, args.peer_device_id);
     const session = await ctx.db
       .query("sessions")
@@ -131,10 +159,16 @@ export const verifyFingerprint = query({
   args: {
     device_id_a: v.string(),
     device_id_b: v.string(),
+    caller_device_id: v.string(),
+    auth_token: v.string(),
     expected_fingerprint: v.string(),
   },
   handler: async (ctx, args) => {
     const [id_a, id_b] = orderPair(args.device_id_a, args.device_id_b);
+    if (args.caller_device_id !== id_a && args.caller_device_id !== id_b) {
+      return { valid: false, reason: "caller_not_in_pair" };
+    }
+    await requireDeviceAuth(ctx, args.caller_device_id, args.auth_token);
     const session = await ctx.db
       .query("sessions")
       .withIndex("by_pair", (q) =>
@@ -154,8 +188,9 @@ export const verifyFingerprint = query({
  * List all active sessions for a given device (so it knows all its paired peers).
  */
 export const listSessions = query({
-  args: { device_id: v.string() },
+  args: { device_id: v.string(), auth_token: v.string() },
   handler: async (ctx, args) => {
+    await requireDeviceAuth(ctx, args.device_id, args.auth_token);
     const asA = await ctx.db
       .query("sessions")
       .withIndex("by_device_a", (q) => q.eq("device_id_a", args.device_id))
@@ -196,9 +231,15 @@ export const revokeSession = mutation({
   args: {
     device_id_a: v.string(),
     device_id_b: v.string(),
+    caller_device_id: v.string(),
+    auth_token: v.string(),
   },
   handler: async (ctx, args) => {
     const [id_a, id_b] = orderPair(args.device_id_a, args.device_id_b);
+    if (args.caller_device_id !== id_a && args.caller_device_id !== id_b) {
+      throw new Error("caller_not_in_pair");
+    }
+    await requireDeviceAuth(ctx, args.caller_device_id, args.auth_token);
     const session = await ctx.db
       .query("sessions")
       .withIndex("by_pair", (q) =>
