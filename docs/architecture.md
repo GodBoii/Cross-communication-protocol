@@ -1,51 +1,47 @@
 # CCP Architecture
 
-## Step 1: Keep The Wire Protocol Platform-Neutral
+## Components
 
-Each OS app can use native UI and native OS APIs, but devices must agree on the same network contract. CCP uses JSON control messages and binary-safe file chunks so Windows, Android, Linux, macOS, and iOS can implement the same behavior independently.
+```text
+Android app (Kotlin/Compose)                 Windows app (WPF/.NET 8)
+  CcpNode ── discovery (UDP 47827)             CcpNode ── same roles
+          ── LAN server (TCP 47828)
+          ── LanPairing / LanSession / FileTransfer   (pure, unit-tested)
+          ── ConvexBridge ───────┐            ConvexService ──┐
+  PeerStore + SecretBox          │            ConfigStore (DPAPI)
+  (Android Keystore)             │                            │
+                                 ▼                            ▼
+                      Convex backend (HTTPS API)
+                      devices · sessions · messages · presence
+```
 
-## Step 2: Discovery Before Transport
+## Principles
 
-For the first Windows/Android version, discovery is LAN-first:
+1. **Platform-neutral wire protocol.** Each OS uses native UI and APIs, but the protocol is the same everywhere (`shared/protocol/ccp-v1.md`), and the cryptography is pinned by shared test vectors that Kotlin, C#, and the Convex helpers all check.
 
-- UDP broadcast port: `47827`
-- TCP session port: `47828`
-- Service name: `ccp.v0`
+2. **Discovery is not trust.** Anyone on the LAN can see and claim a device id. Trust exists only once two devices share a pair secret from an approved pairing. Every capability is served only inside a session keyed from that secret.
 
-Later phases can add mDNS, BLE advertisements, Wi-Fi Direct, WebRTC, and relay servers without changing the app-level message model.
+3. **Pairing resists man-in-the-middle attacks.** Pairing uses ephemeral ECDH with a commitment, followed by a 6-digit code comparison that the user performs (Bluetooth numeric-comparison style). Re-pairing always prompts.
 
-## Step 3: Pair Before Capabilities
+4. **The relay is untrusted.** Convex authenticates callers and stores only ciphertext. Message metadata is bound as AAD, so the relay can't re-label or redirect messages, and replays are rejected client-side.
 
-Devices can see each other before they are trusted. A discovered device is not allowed to request clipboard, notification, file, or native OS access until pairing succeeds. The first version uses a short pairing code and stores trusted peers locally. A later version should replace this with signed public-key pairing and TLS certificates.
+5. **Bounded everything.** Frame sizes, connection counts, idle timeouts, file sizes, chunk counts, prompt timeouts, relay payloads, and TTLs all have explicit limits. Malformed input is dropped and never crashes a listener.
 
-## Step 4: Transfer Files In Resumable Chunks
+6. **Native access stays feature-scoped.** File transfer, notifications, and remote actions are separate request types that can be gated individually. Remote input and clipboard sync aren't implemented yet.
 
-Files are described first, accepted or rejected by the receiver, then sent in numbered chunks. Every transfer has:
+## Data flow: sending a file over the LAN
 
-- `transfer_id`
-- filename
-- size
-- SHA-256 hash
-- chunk size
-- ordered chunks
-- completion verification
+1. The sender opens a TCP connection, sends `session.hello`, and derives the session keys.
+2. The sender sends a sealed `file.offer`. The receiver validates it, checks free space, and prompts the user (Windows) before replying.
+3. Sealed `file.chunk` frames stream in order. The receiver checks each one and appends it to a temp file while hashing incrementally.
+4. On `file.complete`, the receiver verifies count, size, and hash, then moves the file to the inbox (Windows) or MediaStore (Android).
 
-The current Windows implementation uses sequential chunks. The protocol leaves room for resume and parallel chunk streams.
+## Data flow: Long Distance request
 
-## Step 5: Native Access Is A Plugin Layer
+1. The requester encrypts `{v, sent_at, body}` with the cloud key and pushes it to Convex. Convex checks that the two devices have an active session.
+2. The recipient polls, decrypts, checks age and replay, handles the request, pushes the response, and acks the original.
+3. The requester resolves its pending request when it receives a matching `.response` from that peer.
 
-Native OS access should be feature-scoped:
+## Platform choices
 
-- File transfer: filesystem picker and downloads/inbox access.
-- Clipboard sync: clipboard APIs and explicit permissions.
-- Notifications: Android notification listener, Windows toast listener/sender.
-- Remote input: accessibility/input APIs, opt-in only.
-- Media control: platform media session APIs.
-
-This keeps powerful features auditable instead of mixing them into the core transport.
-
-## Current Platform Choices
-
-Windows should use C#/.NET WPF first. It gives native Windows UI, file dialogs, notifications, tray support, startup registration, firewall integration, Windows credential storage, and access to WinRT/Win32 APIs when needed. C++ or Rust can still be added later as helper libraries for hot paths or low-level device features.
-
-Android should use Kotlin and the Android SDK directly. This gives foreground services, notification access, Bluetooth, NFC, USB, Wi-Fi APIs, scoped storage, sensors, and system broadcasts. A Capacitor shell can make a UI quickly, but it is not the right base for the OS-level bridge.
+Windows uses C#/WPF for native dialogs, DPAPI, and WinRT/Win32 access. Android uses Kotlin and the SDK directly for foreground services, notification access, MediaStore, and the Keystore. A Capacitor shell exists in the npm dependencies but isn't wired into the Android build.

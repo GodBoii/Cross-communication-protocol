@@ -1,28 +1,52 @@
 # CCP - Cross-Platform Connectivity Protocol
 
-CCP is a local-first cross-device connectivity project. The repository is split by operating system so each platform can be built from its own folder.
+CCP connects your own devices directly over the local network and, when they are apart, through an end-to-end encrypted cloud relay. Windows and Android are implemented; the other platform folders are placeholders.
 
-## Folder Layout
+## Folder layout
 
 ```text
-android/   Android app source. Open in Android Studio and build APKs here.
-windows/   Windows desktop app and backend. Build EXEs here.
-linux/     Reserved for future Linux client and .deb packaging.
-macos/     Reserved for future macOS client.
-ios/       Reserved for future iOS client.
-shared/    Protocol docs, message schemas, and cross-platform contracts.
-docs/      Architecture and implementation notes.
+android/   Native Android app (Kotlin, Jetpack Compose). Build APKs here.
+windows/   Native Windows app (WPF, .NET 8) and its test project.
+convex/    Convex backend for the cloud relay (devices, sessions, messages, presence).
+shared/    Protocol spec, message schema, and cross-platform crypto test vectors.
+tests/     Node tests for the Convex helpers.
+docs/      Architecture notes, walkthrough, audits.
+linux/ macos/ ios/   Reserved for future clients.
 ```
 
-## Current Focus
+## What it does
 
-The first implementation targets Windows and Android:
+- LAN discovery over UDP broadcast, with route advertisement for Wi-Fi, Ethernet, USB tethering and Bluetooth PAN.
+- Pairing with ephemeral ECDH P-256 keys: both screens show the same 6-digit code, and the other device's user approves.
+- All LAN traffic after pairing is encrypted and authenticated (AES-256-GCM, per-direction keys, replay protection).
+- Streamed, hash-verified file transfer with size limits.
+- Remote panel: device snapshot, recent media and files, notifications (Android), and remote actions (Android).
+- "Long Distance" mode: the same requests go through Convex, encrypted with a key that only the two paired devices can derive.
 
-- LAN discovery over UDP broadcast.
-- Device identity and trust-on-first-use pairing.
-- Multi-route discovery metadata for Wi-Fi, LAN, USB networking, Bluetooth-backed IP paths, and internet-capable environments.
-- TCP control channel with newline-delimited JSON and route fallback across advertised endpoints.
-- Chunked file transfer with SHA-256 verification.
-- GUI shells for Windows and Android.
+See [shared/protocol/ccp-v1.md](shared/protocol/ccp-v1.md) for the wire protocol and [docs/codebase-walkthrough.md](docs/codebase-walkthrough.md) for a tour of the code.
 
-See [ccp-v0.md](C:/Users/prajw/Downloads/CCP/shared/protocol/ccp-v0.md) for the protocol and [codebase-walkthrough.md](C:/Users/prajw/Downloads/CCP/docs/codebase-walkthrough.md) for the implementation walkthrough.
+## Build and test
+
+| Component | Command |
+| --- | --- |
+| Convex typecheck + tests | `npm ci` then `npm test` |
+| Android | `cd android` then `./gradlew testDebugUnitTest assembleDebug` (JDK 17–21) |
+| Android release (R8) | `./gradlew assembleRelease`; override the relay with `-PccpConvexUrl=https://<deployment>.convex.cloud` |
+| Windows | `dotnet build windows/native-csharp/CCP.Windows.csproj` |
+| Windows tests | `dotnet test windows/CCP.Windows.Tests/CCP.Windows.Tests.csproj` |
+
+CI (`.github/workflows/ci.yml`) runs all of the above on every push and pull request.
+
+## Deploying the backend
+
+The Convex functions changed incompatibly in v1 (token-bound device ids, session-gated messaging). Deploy them before shipping v1 clients:
+
+```bash
+npx convex deploy
+```
+
+v0 clients can't use the v1 backend, and v1 clients can't pair with v0 clients. Devices paired under v0 must pair again.
+
+## Security model in one paragraph
+
+A device's identity is a random token that stays on the device, stored in the Android Keystore or Windows DPAPI. Its public id is a hash of that token, so the relay can verify who registers an id. Trust between two devices exists only after a user-approved pairing whose comparison code defeats man-in-the-middle attacks. Every capability request then has to arrive over a channel keyed from that pairing. Copying a device's broadcast id gets an attacker nothing. Details and known limitations are in the protocol spec.

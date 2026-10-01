@@ -1,4 +1,8 @@
-# CCP Protocol v0
+# CCP Protocol v0 (superseded)
+
+> Historical. v0 had no authenticated trust: device ids were spoofable,
+> pair secrets were sent in clear, and v0 peers are not accepted by current
+> builds. See [ccp-v1.md](ccp-v1.md).
 
 ## Constants
 

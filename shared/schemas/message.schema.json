@@ -1,24 +1,36 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ccp.local/schemas/message.schema.json",
-  "title": "CCP v0 Message",
-  "$comment": "Discovery packets also include optional transports and endpoints objects for route advertisement.",
-  "type": "object",
-  "required": ["protocol", "id", "type", "sender", "payload", "timestamp"],
-  "properties": {
-    "protocol": { "const": "ccp.v0" },
-    "id": { "type": "string" },
-    "type": { "type": "string" },
-    "sender": {
+  "title": "CCP v1 Message",
+  "$comment": "Plain-text envelopes (pair.*, session.hello*, session.error) and the JSON inside sealed LAN frames. A sealed frame on the wire is {\"sealed\": \"<base64>\"}. See shared/protocol/ccp-v1.md.",
+  "oneOf": [
+    {
       "type": "object",
-      "required": ["device_id", "device_name", "platform"],
+      "required": ["protocol", "id", "type", "sender", "payload", "timestamp"],
       "properties": {
-        "device_id": { "type": "string" },
-        "device_name": { "type": "string" },
-        "platform": { "type": "string" }
+        "protocol": { "const": "ccp.v1" },
+        "id": { "type": "string", "maxLength": 64 },
+        "type": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "maxLength": 64 },
+        "sender": {
+          "type": "object",
+          "required": ["device_id", "device_name", "platform"],
+          "properties": {
+            "device_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "device_name": { "type": "string", "maxLength": 64 },
+            "platform": { "type": "string", "maxLength": 16 }
+          }
+        },
+        "payload": { "type": "object" },
+        "timestamp": { "type": "number" }
       }
     },
-    "payload": { "type": "object" },
-    "timestamp": { "type": "number" }
-  }
+    {
+      "type": "object",
+      "required": ["sealed"],
+      "additionalProperties": false,
+      "properties": {
+        "sealed": { "type": "string", "contentEncoding": "base64" }
+      }
+    }
+  ]
 }
