@@ -1,4 +1,4 @@
-package com.getcapacitor.myapp;
+package com.ccp.android;
 
 import static org.junit.Assert.assertEquals;
 
@@ -9,7 +9,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 @RunWith(AndroidJUnit4.class)
-public class ExampleInstrumentedTest {
+public class AppPackageTest {
 
     @Test
     public void appContextUsesCcpPackage() {
