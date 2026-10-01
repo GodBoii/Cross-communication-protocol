@@ -26,6 +26,13 @@ public sealed class ConfigStore
         {
             _config = _config with { CloudAuthTokenB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) };
         }
+        // v1 identity: the device id is bound to the cloud auth token so the
+        // Convex backend can verify ownership of the id.
+        var derivedId = DeriveDeviceId(_config.CloudAuthTokenB64);
+        if (!string.Equals(_config.DeviceId, derivedId, StringComparison.Ordinal))
+        {
+            _config = _config with { DeviceId = derivedId };
+        }
         Save();
     }
 
@@ -61,6 +68,15 @@ public sealed class ConfigStore
             _config.PairSecrets[sender.DeviceId] = pairSecretB64;
         }
         Save();
+    }
+
+    public const string DeviceIdPrefix = "ccp-device-id-v1:";
+
+    /// <summary>device_id = sha256_hex("ccp-device-id-v1:" + sha256_hex(token)).</summary>
+    public static string DeriveDeviceId(string cloudAuthToken)
+    {
+        var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cloudAuthToken))).ToLowerInvariant();
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(DeviceIdPrefix + tokenHash))).ToLowerInvariant();
     }
 
     private void Save()

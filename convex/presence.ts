@@ -1,68 +1,52 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { LIMITS, assertMaxLength, canSee, requireDevice } from "./lib/auth";
 
-/** Heartbeat interval after which a device is considered offline: 30 seconds */
+/** Heartbeat age after which a device is considered offline: 30 seconds */
 const OFFLINE_THRESHOLD_MS = 30_000;
 
-async function sha256Hex(input: string): Promise<string> {
-  const bytes = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function requireDeviceAuth(ctx: any, deviceId: string, authToken: string) {
-  if (!authToken) throw new Error("auth_required");
-  const device = await ctx.db
-    .query("devices")
-    .withIndex("by_device_id", (q: any) => q.eq("device_id", deviceId))
-    .first();
-  if (!device?.auth_token_hash) throw new Error("device_not_registered");
-  if ((await sha256Hex(authToken)) !== device.auth_token_hash) {
-    throw new Error("auth_failed");
-  }
-}
+const OFFLINE = { online: false, last_heartbeat: 0, ip_hint: "", tcp_port: 0 };
 
 /**
- * Upsert a presence heartbeat for a device.
- * Each device should call this every ~10 seconds while running.
+ * Upsert a presence heartbeat for the caller.
  *
- * ip_hint is an *obfuscated* partial IP (e.g. first two octets only) that
- * the peer can use as a fallback hint to attempt a direct connection before
- * falling through to the full cloud relay.  We deliberately don't store the
- * full IP — the peer still needs to perform discovery for the exact address.
+ * ip_hint is an obfuscated partial IP (e.g. "192.168.x.x") that peers can use
+ * as a hint before falling back to the cloud relay. The full IP is never stored.
  */
 export const heartbeat = mutation({
   args: {
     device_id: v.string(),
     auth_token: v.string(),
-    ip_hint: v.string(),       // e.g. "192.168.x.x" or blank
+    ip_hint: v.string(),
     tcp_port: v.number(),
   },
   handler: async (ctx, args) => {
-    await requireDeviceAuth(ctx, args.device_id, args.auth_token);
+    const device = await requireDevice(ctx, args.device_id, args.auth_token);
+    assertMaxLength("ip_hint", args.ip_hint, LIMITS.ipHint);
+    if (!Number.isInteger(args.tcp_port) || args.tcp_port < 0 || args.tcp_port > 65535) {
+      throw new Error("invalid_tcp_port");
+    }
     const now = Date.now();
     const existing = await ctx.db
       .query("presence")
       .withIndex("by_device_id", (q) => q.eq("device_id", args.device_id))
       .first();
 
+    const fields = {
+      online: true,
+      last_heartbeat: now,
+      ip_hint: args.ip_hint,
+      tcp_port: args.tcp_port,
+    };
     if (existing) {
-      await ctx.db.patch(existing._id, {
-        online: true,
-        last_heartbeat: now,
-        ip_hint: args.ip_hint,
-        tcp_port: args.tcp_port,
-      });
+      await ctx.db.patch(existing._id, fields);
     } else {
-      await ctx.db.insert("presence", {
-        device_id: args.device_id,
-        online: true,
-        last_heartbeat: now,
-        ip_hint: args.ip_hint,
-        tcp_port: args.tcp_port,
-      });
+      await ctx.db.insert("presence", { device_id: args.device_id, ...fields });
+    }
+
+    // Keep the registry's last_seen roughly current without a write per beat.
+    if (now - device.last_seen > 5 * 60 * 1000) {
+      await ctx.db.patch(device._id, { last_seen: now });
     }
 
     return { status: "ok", server_time: now };
@@ -70,12 +54,12 @@ export const heartbeat = mutation({
 });
 
 /**
- * Mark a device as offline (called on clean shutdown).
+ * Mark the caller offline (called on clean shutdown).
  */
 export const goOffline = mutation({
   args: { device_id: v.string(), auth_token: v.string() },
   handler: async (ctx, args) => {
-    await requireDeviceAuth(ctx, args.device_id, args.auth_token);
+    await requireDevice(ctx, args.device_id, args.auth_token);
     const existing = await ctx.db
       .query("presence")
       .withIndex("by_device_id", (q) => q.eq("device_id", args.device_id))
@@ -89,8 +73,9 @@ export const goOffline = mutation({
 });
 
 /**
- * Get the presence status of a specific device.
- * Returns online=false if the last heartbeat is older than OFFLINE_THRESHOLD_MS.
+ * Presence of a device the caller is paired with (or itself).
+ * Unpaired devices always appear offline so presence can't be used to track
+ * arbitrary devices.
  */
 export const getPresence = query({
   args: {
@@ -99,13 +84,16 @@ export const getPresence = query({
     auth_token: v.string(),
   },
   handler: async (ctx, args) => {
-    await requireDeviceAuth(ctx, args.requester_device_id, args.auth_token);
+    await requireDevice(ctx, args.requester_device_id, args.auth_token);
+    if (!(await canSee(ctx, args.requester_device_id, args.device_id))) {
+      return { device_id: args.device_id, ...OFFLINE };
+    }
     const presence = await ctx.db
       .query("presence")
       .withIndex("by_device_id", (q) => q.eq("device_id", args.device_id))
       .first();
 
-    if (!presence) return { device_id: args.device_id, online: false, last_heartbeat: 0, ip_hint: "", tcp_port: 0 };
+    if (!presence) return { device_id: args.device_id, ...OFFLINE };
 
     const effectivelyOnline =
       presence.online && Date.now() - presence.last_heartbeat < OFFLINE_THRESHOLD_MS;
@@ -121,7 +109,7 @@ export const getPresence = query({
 });
 
 /**
- * Get presence for all devices in a list (bulk fetch for dashboard).
+ * Bulk presence for paired devices (dashboard).
  */
 export const getBulkPresence = query({
   args: {
@@ -130,11 +118,16 @@ export const getBulkPresence = query({
     auth_token: v.string(),
   },
   handler: async (ctx, args) => {
-    await requireDeviceAuth(ctx, args.requester_device_id, args.auth_token);
+    await requireDevice(ctx, args.requester_device_id, args.auth_token);
+    if (args.device_ids.length > LIMITS.bulkPresenceMax) throw new Error("too_many_device_ids");
     const now = Date.now();
     const results: Record<string, boolean> = {};
 
     for (const id of args.device_ids) {
+      if (!(await canSee(ctx, args.requester_device_id, id))) {
+        results[id] = false;
+        continue;
+      }
       const presence = await ctx.db
         .query("presence")
         .withIndex("by_device_id", (q) => q.eq("device_id", id))

@@ -20,7 +20,6 @@ public sealed class ConvexService : IDisposable
     private readonly string _deviceName;
     private readonly byte[] _publicKey;
     private readonly string _cloudAuthToken;
-    private readonly string _cloudAuthTokenHash;
     private readonly Dictionary<string, byte[]> _sessionKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _sessionLock = new(1, 1);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonObject>> _pendingRequests = new();
@@ -38,7 +37,6 @@ public sealed class ConvexService : IDisposable
         _deviceId = deviceId;
         _deviceName = deviceName;
         _cloudAuthToken = cloudAuthToken;
-        _cloudAuthTokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cloudAuthToken))).ToLowerInvariant();
         _publicKey = SHA256.HashData([.. privateKey, .. "ccp-pub"u8.ToArray()]);
         PublicKeyB64 = Convert.ToBase64String(_publicKey);
     }
@@ -77,7 +75,7 @@ public sealed class ConvexService : IDisposable
                 ["public_key_b64"] = PublicKeyB64,
                 ["capabilities"] = new JsonArray("pairing", "file.transfer", "remote.action", "device.snapshot"),
                 ["app_version"] = appVersion,
-                ["auth_token_hash"] = _cloudAuthTokenHash,
+                ["auth_token"] = _cloudAuthToken,
             }, ct);
             SetStatus("Cloud connected");
             Log("Registered on Convex");

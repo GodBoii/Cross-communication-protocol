@@ -63,6 +63,7 @@ class CcpNode(private val context: Context) {
         context = context,
         deviceId = store.deviceId,
         deviceName = store.deviceName,
+        cloudAuthToken = store.cloudAuthToken,
         platform = "android",
         onMessage = { msg -> handleConvexMessage(msg) },
     )

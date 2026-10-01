@@ -97,8 +97,8 @@ artifacts/
 *.bak
 *.orig
 
-# Convex generated files
-convex/_generated/
+# Convex generated files are committed (Convex recommends this) so the
+# functions can be typechecked without deployment access.
 
 # Stray / scratch files
 New Text Document.txt

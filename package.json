@@ -1,16 +1,25 @@
 {
+  "name": "ccp",
+  "private": true,
+  "description": "CCP cross-platform connectivity: Convex relay backend and Capacitor shell",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "convex:codegen": "convex codegen",
-    "check": "npm run convex:codegen",
+    "typecheck": "tsc -p convex",
+    "check": "npm run typecheck",
     "test": "npm run check",
+    "convex:codegen": "convex codegen",
+    "convex:deploy": "convex deploy",
     "audit": "npm audit"
   },
   "dependencies": {
-    "@capacitor/android": "^8.4.1",
-    "@capacitor/cli": "^8.4.1",
-    "@capacitor/core": "^8.4.1"
+    "@capacitor/android": "8.4.1",
+    "@capacitor/cli": "8.4.1",
+    "@capacitor/core": "8.4.1"
   },
   "devDependencies": {
-    "convex": "^1.42.0"
+    "convex": "1.42.0",
+    "typescript": "5.9.3"
   }
 }

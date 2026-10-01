@@ -15,7 +15,7 @@ export default defineSchema({
   // Every device that has ever connected registers itself here.
   // device_id is the SHA-256 fingerprint generated locally on first run.
   devices: defineTable({
-    device_id: v.string(),          // local SHA-256 identity (primary key by index)
+    device_id: v.string(),          // sha256("ccp-device-id-v1:" + auth_token_hash)
     device_name: v.string(),         // human-readable label ("Prajwal's Windows PC")
     platform: v.string(),            // "windows" | "android" | "macos" | "linux"
     public_key_b64: v.string(),      // base64 X25519 / ECDH public key
@@ -28,9 +28,10 @@ export default defineSchema({
     .index("by_platform", ["platform"]),
 
   // ── Session / Key Exchange ──────────────────────────────────────────────────
-  // When two devices first connect over WiFi they perform an ECDH key exchange.
-  // The resulting shared secret is stored as an AES-256-GCM encrypted blob so
-  // both sides can later verify they share the same secret without exposing it.
+  // Two devices pair on the LAN with an ephemeral ECDH P-256 exchange plus a
+  // user-verified comparison code. The derived pair secret never leaves the
+  // devices; this row only records the pairing, a wrapped copy of the session
+  // key (opaque to Convex) and its fingerprint.
   //
   // canonical ordering: device_id_a < device_id_b (lexicographic) so the pair
   // is always stored once regardless of who initiated.
@@ -66,7 +67,7 @@ export default defineSchema({
     nonce: v.string(),               // base64 AES-GCM nonce (12 bytes)
     msg_id: v.string(),              // client-generated UUID (idempotency)
     created_at: v.number(),          // unix ms
-    delivered: v.boolean(),          // true once recipient acks delivery
+    delivered: v.boolean(),          // always false; acked messages are deleted
     expires_at: v.number(),          // unix ms; messages auto-purge after TTL
   })
     .index("by_recipient", ["recipient_id", "delivered"])

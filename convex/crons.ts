@@ -1,18 +1,18 @@
 import { cronJobs } from "convex/server";
-import { api } from "./_generated/api";
+import { internal } from "./_generated/api";
 
 /**
  * Scheduled jobs for CCP backend maintenance.
  *
- * - purge_expired_messages: every hour, clean up delivered or expired messages
- *   to keep the database lean.
+ * - purge expired messages: hourly, delete relay messages past their TTL.
+ *   Acked messages are deleted on ack, so only undelivered ones expire here.
  */
 const crons = cronJobs();
 
 crons.hourly(
   "purge expired messages",
   { minuteUTC: 0 },
-  api.messages.purgeExpiredMessages
+  internal.messages.purgeExpiredMessages
 );
 
 export default crons;

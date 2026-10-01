@@ -60,6 +60,7 @@ class ConvexBridge(
     private val convexUrl: String = CONVEX_URL,
     private val deviceId: String,
     private val deviceName: String,
+    private val cloudAuthToken: String,
     private val platform: String = "android",
     private val onMessage: ((ConvexMessage) -> Unit)? = null,
 ) {
@@ -74,8 +75,6 @@ class ConvexBridge(
     val publicKeyB64: String = Base64.encodeToString(
         sha256(privateKeyBytes + "ccp-pub".toByteArray()), Base64.NO_WRAP
     )
-    private val cloudAuthToken: String = getOrCreateCloudAuthToken()
-    private val cloudAuthTokenHash: String = sha256(cloudAuthToken.toByteArray()).toHex()
 
     // In-memory session cache: peer_device_id → raw 32-byte AES key
     private val sessionKeys = HashMap<String, ByteArray>()
@@ -104,7 +103,7 @@ class ConvexBridge(
                     put("device_name", deviceName)
                     put("platform", platform)
                     put("public_key_b64", publicKeyB64)
-                    put("auth_token_hash", cloudAuthTokenHash)
+                    put("auth_token", cloudAuthToken)
                     put("capabilities", JSONArray(capabilities))
                     put("app_version", appVersion)
                 })
@@ -514,15 +513,6 @@ class ConvexBridge(
         val key = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
         prefs.edit().putString("convex_private_key", Base64.encodeToString(key, Base64.NO_WRAP)).apply()
         return key
-    }
-
-    private fun getOrCreateCloudAuthToken(): String {
-        val stored = prefs.getString("cloud_auth_token", null)
-        if (stored != null) return stored
-        val token = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
-        val encoded = Base64.encodeToString(token, Base64.NO_WRAP)
-        prefs.edit().putString("cloud_auth_token", encoded).apply()
-        return encoded
     }
 
     private fun logCloud(msg: String) {
