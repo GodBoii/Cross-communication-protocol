@@ -40,6 +40,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public ICommand PairCommand { get; }
     public ICommand InspectCommand { get; }
+    public ICommand UnpairCommand { get; }
     public ICommand SendFileCommand { get; }
     public ICommand RefreshCommand { get; }
     public ICommand RefreshPanelCommand { get; }
@@ -231,6 +232,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         PairCommand = new RelayCommand<PeerView>(peer => _ = PairPeerAsync(peer), peer => peer is not null);
         InspectCommand = new RelayCommand<PeerView>(peer => SelectedPeer = peer, peer => peer?.Trusted == true);
         SendFileCommand = new RelayCommand<PeerView>(SendFile, peer => peer?.Trusted == true);
+        UnpairCommand = new RelayCommand<PeerView>(peer => _ = UnpairPeerAsync(peer), peer => peer?.Trusted == true);
         RefreshCommand = new RelayCommand<object>(_ => _node.BroadcastNow());
         RefreshPanelCommand = new RelayCommand<object>(_ => _ = LoadPeerPanelAsync(), _ => SelectedPeer?.Trusted == true);
         DialCommand = new RelayCommand<object>(_ =>
@@ -283,6 +285,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (peer is null) return;
         await _node.PairAsync(peer);
         await LoadPeerPanelAsync();
+    }
+
+    private async Task UnpairPeerAsync(PeerView? peer)
+    {
+        if (peer is null) return;
+        var confirmed = MessageBox.Show(this,
+            $"Unpair {peer.DeviceName}?\n\nIt will no longer be able to reach this PC on the network or through Long Distance. You can pair again later.",
+            "Unpair device", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes;
+        if (!confirmed) return;
+        if (SelectedPeer?.DeviceId == peer.DeviceId)
+        {
+            _panelLoopCts?.Cancel();
+            ResetPanel(peer.DeviceName, "Pair with this device to browse gallery, files, notifications, and settings.");
+        }
+        await _node.UnpairAsync(peer);
     }
 
     private void SendFile(PeerView? peer)

@@ -51,8 +51,11 @@ import androidx.compose.material.icons.rounded.PermDeviceInformation
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.LinkOff
 import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -219,6 +222,7 @@ fun CcpScreen(
     val cloudMessages by node.convexBridge.cloudMessages.collectAsState()
     var selectedPeer by remember { mutableStateOf<DeviceInfo?>(null) }
     var inspectedPeerId by remember { mutableStateOf<String?>(null) }
+    var unpairCandidate by remember { mutableStateOf<DeviceInfo?>(null) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         node.refreshLocalData()
     }
@@ -310,7 +314,24 @@ fun CcpScreen(
                     selectedPeer = it
                     picker.launch(arrayOf("*/*"))
                 },
-                onSelectTransport = { peer, transport -> node.setPreferredTransport(peer.deviceId, transport) }
+                onSelectTransport = { peer, transport -> node.setPreferredTransport(peer.deviceId, transport) },
+                onUnpair = { unpairCandidate = it }
+            )
+        }
+
+        unpairCandidate?.let { peer ->
+            AlertDialog(
+                onDismissRequest = { unpairCandidate = null },
+                title = { Text("Unpair ${peer.deviceName}?") },
+                text = { Text("It will no longer be able to reach this device on the network or through Long Distance. You can pair again later.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (inspectedPeerId == peer.deviceId) inspectedPeerId = null
+                        node.unpair(peer)
+                        unpairCandidate = null
+                    }) { Text("Unpair") }
+                },
+                dismissButton = { TextButton(onClick = { unpairCandidate = null }) { Text("Cancel") } }
             )
         }
 
@@ -487,7 +508,8 @@ fun NearbyDevicesCard(
     onPair: (DeviceInfo) -> Unit,
     onInspect: (DeviceInfo) -> Unit,
     onSend: (DeviceInfo) -> Unit,
-    onSelectTransport: (DeviceInfo, String) -> Unit
+    onSelectTransport: (DeviceInfo, String) -> Unit,
+    onUnpair: (DeviceInfo) -> Unit
 ) {
     ObsidianCard {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -534,7 +556,8 @@ fun NearbyDevicesCard(
                             onPair = { onPair(peer) },
                             onInspect = { onInspect(peer) },
                             onSend = { onSend(peer) },
-                            onSelectTransport = { onSelectTransport(peer, it) }
+                            onSelectTransport = { onSelectTransport(peer, it) },
+                            onUnpair = { onUnpair(peer) }
                         )
                     }
                 }
@@ -638,7 +661,15 @@ fun ActivityCard(events: List<String>) {
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
-fun DeviceRow(peer: DeviceInfo, preferredTransport: String, onPair: () -> Unit, onInspect: () -> Unit, onSend: () -> Unit, onSelectTransport: (String) -> Unit) {
+fun DeviceRow(
+    peer: DeviceInfo,
+    preferredTransport: String,
+    onPair: () -> Unit,
+    onInspect: () -> Unit,
+    onSend: () -> Unit,
+    onSelectTransport: (String) -> Unit,
+    onUnpair: () -> Unit = {},
+) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -670,8 +701,11 @@ fun DeviceRow(peer: DeviceInfo, preferredTransport: String, onPair: () -> Unit, 
                 Text("Pair", fontSize = 12.sp)
             }
         } else {
+            OutlinedButton(onClick = onUnpair, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim), modifier = Modifier.height(36.dp)) {
+                Icon(Icons.Rounded.LinkOff, "Unpair ${peer.deviceName}", Modifier.size(16.dp))
+            }
             OutlinedButton(onClick = onInspect, border = BorderStroke(1.dp, BorderGlass), colors = ButtonDefaults.outlinedButtonColors(containerColor = ButtonGlass, contentColor = TextPrim), modifier = Modifier.height(36.dp)) {
-                Icon(Icons.Rounded.Visibility, null, Modifier.size(16.dp))
+                Icon(Icons.Rounded.Visibility, "Inspect ${peer.deviceName}", Modifier.size(16.dp))
             }
             Button(onClick = onSend, colors = ButtonDefaults.buttonColors(containerColor = AccentBrand, contentColor = Void), modifier = Modifier.height(36.dp)) {
                 Text("Send", fontSize = 12.sp, fontWeight = FontWeight.Bold)

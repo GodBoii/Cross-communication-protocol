@@ -163,6 +163,30 @@ public sealed class CcpNode : IDisposable
         return null;
     });
 
+    /// <summary>
+    /// Forgets a peer: deletes its pair secret (so its sessions and relay
+    /// messages are refused from now on) and revokes the relay session.
+    /// </summary>
+    public async Task UnpairAsync(PeerView peer)
+    {
+        _config.Forget(peer.DeviceId);
+        _lastSessionSync.TryRemove(peer.DeviceId, out _);
+        if (peer.IsCloudPeer)
+        {
+            _peers.TryRemove(peer.DeviceId, out _);
+            PublishPeers();
+        }
+        else if (_peers.TryGetValue(peer.DeviceId, out var current))
+        {
+            UpsertPeer(current with { Trusted = false });
+        }
+        _onEvent($"Unpaired {peer.DeviceName}");
+        if (!await Convex.RevokeSessionAsync(peer.DeviceId))
+        {
+            _onEvent($"Long Distance session for {peer.DeviceName} will stay until the relay is reachable; it can no longer be decrypted here.");
+        }
+    }
+
     public void CancelOutgoingPair()
     {
         try { _outgoingPairClient?.Close(); } catch (ObjectDisposedException) { }

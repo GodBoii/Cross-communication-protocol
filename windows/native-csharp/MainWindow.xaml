@@ -129,6 +129,13 @@
                                 <Binding Path="Trusted" Converter="{StaticResource InvertBoolToVis}"/>
                             </Button.Visibility>
                         </Button>
+                        <Button Content="Unpair" Command="{Binding DataContext.UnpairCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                CommandParameter="{Binding}" Style="{StaticResource SecondaryBtn}" Margin="0,0,6,0"
+                                AutomationProperties.Name="{Binding DeviceName, StringFormat=Unpair {0}}">
+                            <Button.Visibility>
+                                <Binding Path="Trusted" Converter="{StaticResource BoolToVis}"/>
+                            </Button.Visibility>
+                        </Button>
                         <Button Content="Inspect" Command="{Binding DataContext.InspectCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
                                 CommandParameter="{Binding}" Style="{StaticResource SecondaryBtn}" Margin="0,0,6,0">
                             <Button.Visibility>

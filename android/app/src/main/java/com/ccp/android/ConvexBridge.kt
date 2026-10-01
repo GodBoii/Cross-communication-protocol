@@ -222,6 +222,22 @@ class ConvexBridge(
 
     // ── Peer metadata ──────────────────────────────────────────────────────
 
+    /** Revokes the relay session so neither side can message the other through Convex. */
+    fun revokeSession(peerDeviceId: String): Boolean {
+        val (idA, idB) = if (deviceId < peerDeviceId) deviceId to peerDeviceId else peerDeviceId to deviceId
+        return try {
+            call("mutation", "sessions:revokeSession", auth()
+                .put("device_id_a", idA)
+                .put("device_id_b", idB)
+                .put("caller_device_id", deviceId))
+            logCloud("Session with ${peerDeviceId.take(8)}… revoked")
+            true
+        } catch (e: Exception) {
+            logCloud("Session revoke failed: ${e.message}")
+            false
+        }
+    }
+
     fun getPeerPresence(peerDeviceId: String): JSONObject? = safeQuery("presence:getPresence", auth()
         .put("device_id", peerDeviceId)
         .put("requester_device_id", deviceId)) as? JSONObject

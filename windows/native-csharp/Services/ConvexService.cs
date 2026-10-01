@@ -141,6 +141,28 @@ public sealed partial class ConvexService : IDisposable
         }
     }
 
+    /// <summary>Revokes the relay session so neither side can message the other through Convex.</summary>
+    public async Task<bool> RevokeSessionAsync(string peerDeviceId)
+    {
+        var (idA, idB) = string.CompareOrdinal(_deviceId, peerDeviceId) < 0 ? (_deviceId, peerDeviceId) : (peerDeviceId, _deviceId);
+        try
+        {
+            await CallAsync("mutation", "sessions:revokeSession", Auth(new JsonObject
+            {
+                ["device_id_a"] = idA,
+                ["device_id_b"] = idB,
+                ["caller_device_id"] = _deviceId,
+            }));
+            Log($"Session with {Short(peerDeviceId)} revoked");
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException)
+        {
+            Log($"Session revoke failed: {ex.Message}");
+            return false;
+        }
+    }
+
     private byte[]? KeyFor(string peerDeviceId) =>
         _pairSecretFor(peerDeviceId) is { } secret ? CcpCloudKeys.CloudKey(secret, _deviceId, peerDeviceId) : null;
 

@@ -247,6 +247,30 @@ class CcpNode(private val context: Context) {
         }
     }
 
+    /**
+     * Forgets a peer: deletes its pair secret (so its sessions and relay
+     * messages are refused from now on) and revokes the relay session.
+     */
+    fun unpair(peer: DeviceInfo) {
+        store.forget(peer.deviceId)
+        lastSessionSync.remove(peer.deviceId)
+        synchronized(peerLock) {
+            if (peer.isCloudPeer) {
+                peersById.remove(peer.deviceId)
+            } else {
+                peersById[peer.deviceId]?.let { peersById[peer.deviceId] = it.copy(trusted = false) }
+            }
+            _peers.value = peersById.values.sortedByDescending { it.lastSeen }
+        }
+        _remotePanel.value = null
+        log("Unpaired ${peer.deviceName}")
+        launchTask("Revoking Long Distance for ${peer.deviceName}") {
+            if (!convexBridge.revokeSession(peer.deviceId)) {
+                log("Long Distance session for ${peer.deviceName} will stay until the relay is reachable; it can no longer be decrypted here.")
+            }
+        }
+    }
+
     fun cancelOutgoingPair() {
         runCatching { outgoingPairSocket?.close() }
         _outgoingPair.value = null
