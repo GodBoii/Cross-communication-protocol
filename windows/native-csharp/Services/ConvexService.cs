@@ -1,289 +1,232 @@
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net.Http;
 using System.Net.NetworkInformation;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace CCP.Windows.Services;
 
-public sealed class ConvexService : IDisposable
-{
-    private const string ConvexUrl = "https://reminiscent-raven-475.convex.cloud";
-    private const int HeartbeatIntervalMs = 10_000;
-    private const int PollIntervalMs = 3_000;
-    private const int TcpPort = 47828;
+/// <summary>Convex rejected a call (auth failure, validation error, ...).</summary>
+public sealed class ConvexException(string message) : IOException(message);
 
-    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
+/// <summary>
+/// Windows ↔ Convex cloud relay ("Long Distance"), wire-compatible with the
+/// Android ConvexBridge.
+///
+///  • Every call is authenticated with the device's cloud auth token; the
+///    device id is bound to that token.
+///  • Payloads are AES-256-GCM encrypted with a key both peers derive locally
+///    from their pair secret; sender/recipient/type/msg_id are bound as AAD.
+///  • Messages are acked only after they've been handled; replays are rejected.
+///  • Polling backs off while idle and wakes immediately for outgoing requests.
+/// </summary>
+public sealed partial class ConvexService : IDisposable
+{
+    public const string DefaultConvexUrl = "https://reminiscent-raven-475.convex.cloud";
+    private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan PollActive = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan PollIdleMax = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ActiveWindow = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan MaxMessageAge = TimeSpan.FromDays(8);
+    private const int PollBatch = 20;
+    private const int MaxEncryptedPayloadChars = 512 * 1024;
+    private static readonly byte[] WrapAad = "ccp-cloud-wrap-v1"u8.ToArray();
+
+    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private readonly string _convexUrl;
     private readonly string _deviceId;
     private readonly string _deviceName;
-    private readonly byte[] _publicKey;
     private readonly string _cloudAuthToken;
-    private readonly Dictionary<string, byte[]> _sessionKeys = new(StringComparer.OrdinalIgnoreCase);
-    private readonly SemaphoreSlim _sessionLock = new(1, 1);
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonObject>> _pendingRequests = new();
+    private readonly Func<string, byte[]?> _pairSecretFor;
+    private readonly ConcurrentDictionary<string, PendingRequest> _pendingRequests = new();
+    private readonly ReplayGuard _replayGuard;
+    private readonly SemaphoreSlim _wake = new(0, 1);
 
     private CancellationTokenSource? _cts;
     private Action<string>? _logger;
+    private DateTime _lastActivity = DateTime.MinValue;
 
-    public string PublicKeyB64 { get; }
     public string CloudStatus { get; private set; } = "Connecting...";
     public event Action<string>? OnCloudStatusChanged;
     public event Action<string, string, JsonObject>? OnMessageReceived;
 
-    public ConvexService(string deviceId, string deviceName, byte[] privateKey, string cloudAuthToken)
+    private sealed record PendingRequest(string PeerId, TaskCompletionSource<JsonObject> Completion);
+
+    public ConvexService(string deviceId, string deviceName, string cloudAuthToken, Func<string, byte[]?> pairSecretFor, string? convexUrl = null)
     {
+        _convexUrl = (convexUrl ?? Environment.GetEnvironmentVariable("CCP_CONVEX_URL") ?? DefaultConvexUrl).TrimEnd('/');
+        if (!_convexUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("Convex URL must use HTTPS", nameof(convexUrl));
+        }
         _deviceId = deviceId;
         _deviceName = deviceName;
         _cloudAuthToken = cloudAuthToken;
-        _publicKey = SHA256.HashData([.. privateKey, .. "ccp-pub"u8.ToArray()]);
-        PublicKeyB64 = Convert.ToBase64String(_publicKey);
+        _pairSecretFor = pairSecretFor;
+        _replayGuard = new ReplayGuard(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CCP", "seen-msg-ids.json"));
     }
 
     public void SetLogger(Action<string> logger) => _logger = logger;
 
-    public void Start(string appVersion = "0.2.0")
+    public void Start(string appVersion)
     {
+        if (_cts is not null) return;
         _cts = new CancellationTokenSource();
-        _ = Task.Run(() => RegisterAsync(appVersion, _cts.Token));
-        _ = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
-        _ = Task.Run(() => PollLoopAsync(_cts.Token));
+        var ct = _cts.Token;
+        _ = Task.Run(() => RegisterLoopAsync(appVersion, ct), ct);
+        _ = Task.Run(() => HeartbeatLoopAsync(ct), ct);
+        _ = Task.Run(() => PollLoopAsync(ct), ct);
     }
 
     public async Task StopAsync()
     {
         _cts?.Cancel();
+        foreach (var pending in _pendingRequests.Values) pending.Completion.TrySetCanceled();
+        _pendingRequests.Clear();
         try
         {
-            await MutationAsync("presence:goOffline", AuthArgs(new JsonObject { ["device_id"] = _deviceId }));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await CallAsync("mutation", "presence:goOffline", Auth(new JsonObject { ["device_id"] = _deviceId }), timeout.Token);
         }
-        catch
+        catch (Exception ex) when (ex is IOException or HttpRequestException or OperationCanceledException)
         {
+            // Presence expires on its own after 30 s.
         }
     }
 
-    private async Task RegisterAsync(string appVersion, CancellationToken ct)
+    // ── Sessions ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Records the pairing in Convex so the relay carries messages between the
+    /// two devices. The stored blob is the cloud key wrapped under a key only
+    /// the peers can derive.
+    /// </summary>
+    public async Task<bool> StoreSessionAsync(string peerDeviceId, byte[] pairSecret, string pairedVia = "wifi")
     {
+        var (idA, idB) = string.CompareOrdinal(_deviceId, peerDeviceId) < 0 ? (_deviceId, peerDeviceId) : (peerDeviceId, _deviceId);
+        var cloudKey = CcpCloudKeys.CloudKey(pairSecret, _deviceId, peerDeviceId);
+        var wrapKey = CcpCloudKeys.WrapKey(pairSecret, _deviceId, peerDeviceId);
+        var nonce = CcpCrypto.RandomBytes(12);
+        var blob = new JsonObject
+        {
+            ["v"] = 1,
+            ["nonce"] = CcpCrypto.B64(nonce),
+            ["ciphertext"] = CcpCrypto.B64(CcpCrypto.Seal(wrapKey, nonce, WrapAad, cloudKey)),
+        }.ToJsonString();
+        var fingerprint = CcpCloudKeys.Fingerprint(cloudKey);
         try
         {
-            await MutationAsync("devices:registerDevice", new JsonObject
-            {
-                ["device_id"] = _deviceId,
-                ["device_name"] = _deviceName,
-                ["platform"] = "windows",
-                ["public_key_b64"] = PublicKeyB64,
-                ["capabilities"] = new JsonArray("pairing", "file.transfer", "remote.action", "device.snapshot"),
-                ["app_version"] = appVersion,
-                ["auth_token"] = _cloudAuthToken,
-            }, ct);
-            SetStatus("Cloud connected");
-            Log("Registered on Convex");
-        }
-        catch (Exception ex)
-        {
-            SetStatus("Cloud offline");
-            Log($"Registration failed: {ex.Message}");
-        }
-    }
-
-    public async Task<string> CompleteKeyExchangeAsync(
-        string peerDeviceId,
-        string peerPublicKeyB64,
-        string? pairSecretB64,
-        string pairedVia = "wifi")
-    {
-        if (string.IsNullOrWhiteSpace(pairSecretB64))
-        {
-            Log($"No pair secret for {Short(peerDeviceId)}; re-pair before using cloud relay");
-            return "";
-        }
-
-        var pairSecret = Convert.FromBase64String(pairSecretB64);
-        var idA = string.Compare(_deviceId, peerDeviceId, StringComparison.Ordinal) < 0 ? _deviceId : peerDeviceId;
-        var idB = string.Compare(_deviceId, peerDeviceId, StringComparison.Ordinal) < 0 ? peerDeviceId : _deviceId;
-        var context = Encoding.UTF8.GetBytes($"{idA}|{idB}");
-        var sessionInput = new byte[pairSecret.Length + context.Length];
-        Buffer.BlockCopy(pairSecret, 0, sessionInput, 0, pairSecret.Length);
-        Buffer.BlockCopy(context, 0, sessionInput, pairSecret.Length, context.Length);
-
-        var sessionKey = HKDF.DeriveKey(HashAlgorithmName.SHA256, sessionInput, 32, info: "ccp-session-v1"u8.ToArray());
-        var wrapKey = HKDF.DeriveKey(HashAlgorithmName.SHA256, pairSecret, 32, info: "ccp-session-wrap-v1"u8.ToArray());
-        var fingerprint = Convert.ToHexString(SHA256.HashData(sessionKey)).ToLowerInvariant();
-        var encryptedBlob = Convert.ToBase64String(Encoding.UTF8.GetBytes(
-            JsonSerializer.Serialize(EncryptGcm(wrapKey, sessionKey))));
-
-        try
-        {
-            await MutationAsync("sessions:storeSession", AuthArgs(new JsonObject
+            await CallAsync("mutation", "sessions:storeSession", Auth(new JsonObject
             {
                 ["device_id_a"] = idA,
                 ["device_id_b"] = idB,
-                ["encrypted_key_a"] = encryptedBlob,
-                ["encrypted_key_b"] = encryptedBlob,
+                ["caller_device_id"] = _deviceId,
+                ["encrypted_key_a"] = blob,
+                ["encrypted_key_b"] = blob,
                 ["key_fingerprint"] = fingerprint,
                 ["paired_via"] = pairedVia,
-                ["caller_device_id"] = _deviceId,
             }));
-            Log($"Session stored with {Short(peerDeviceId)} (fp: {Short(fingerprint, 12)})");
+            Log($"Session stored with {Short(peerDeviceId)} (fp {Short(fingerprint, 12)})");
             SetStatus("Cloud relay ready");
-        }
-        catch (Exception ex)
-        {
-            Log($"Session store failed: {ex.Message}");
-        }
-
-        await _sessionLock.WaitAsync();
-        try { _sessionKeys[peerDeviceId] = sessionKey; }
-        finally { _sessionLock.Release(); }
-
-        return fingerprint;
-    }
-
-    public async Task<bool> LoadSessionFromCloudAsync(string peerDeviceId, string? pairSecretB64)
-    {
-        if (string.IsNullOrWhiteSpace(pairSecretB64))
-        {
-            Log($"No pair secret for {Short(peerDeviceId)}; re-pair before using cloud relay");
-            return false;
-        }
-
-        try
-        {
-            var data = await QueryAsync("sessions:getSession", AuthArgs(new JsonObject
-            {
-                ["my_device_id"] = _deviceId,
-                ["peer_device_id"] = peerDeviceId,
-            }));
-            if (data is null) return false;
-
-            var wrapKey = HKDF.DeriveKey(HashAlgorithmName.SHA256,
-                Convert.FromBase64String(pairSecretB64), 32, info: "ccp-session-wrap-v1"u8.ToArray());
-            var blobJson = JsonNode.Parse(
-                Encoding.UTF8.GetString(Convert.FromBase64String(data["encrypted_key"]!.GetValue<string>())))!.AsObject();
-            var sessionKey = DecryptGcm(wrapKey,
-                blobJson["nonce"]!.GetValue<string>(),
-                blobJson["ciphertext"]!.GetValue<string>());
-
-            await _sessionLock.WaitAsync();
-            try { _sessionKeys[peerDeviceId] = sessionKey; }
-            finally { _sessionLock.Release(); }
-
-            Log($"Session loaded for {Short(peerDeviceId)}");
             return true;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException)
         {
-            Log($"Session load failed for {Short(peerDeviceId)}: {ex.Message}");
+            Log($"Session store failed: {ex.Message}");
             return false;
         }
     }
 
-    public async Task<bool> EnsureSessionKeyAsync(string peerDeviceId, string? pairSecretB64)
-    {
-        if (await GetSessionKeyAsync(peerDeviceId) is not null) return true;
-        return await LoadSessionFromCloudAsync(peerDeviceId, pairSecretB64);
-    }
+    private byte[]? KeyFor(string peerDeviceId) =>
+        _pairSecretFor(peerDeviceId) is { } secret ? CcpCloudKeys.CloudKey(secret, _deviceId, peerDeviceId) : null;
 
-    public async Task<byte[]?> GetSessionKeyAsync(string peerDeviceId)
-    {
-        await _sessionLock.WaitAsync();
-        try
-        {
-            return _sessionKeys.TryGetValue(peerDeviceId, out var key) ? key : null;
-        }
-        finally { _sessionLock.Release(); }
-    }
+    // ── Messages ────────────────────────────────────────────────────────────
 
     public async Task<bool> PushMessageAsync(string peerDeviceId, string msgType, JsonObject payload, long? ttlMs = null)
     {
-        var key = await GetSessionKeyAsync(peerDeviceId);
+        var key = KeyFor(peerDeviceId);
         if (key is null)
         {
-            Log($"No session for {Short(peerDeviceId)}; pair first");
+            Log($"Not paired with {Short(peerDeviceId)}; pair first");
             return false;
         }
 
-        var enc = EncryptGcm(key, Encoding.UTF8.GetBytes(payload.ToJsonString()));
-        var args = AuthArgs(new JsonObject
+        var msgId = Guid.NewGuid().ToString();
+        var plaintext = Encoding.UTF8.GetBytes(new JsonObject
+        {
+            ["v"] = 1,
+            ["sent_at"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["body"] = payload.DeepClone(),
+        }.ToJsonString());
+        var nonce = CcpCrypto.RandomBytes(12);
+        var aad = CcpCloudKeys.MessageAad(_deviceId, peerDeviceId, msgType, msgId);
+        var encoded = CcpCrypto.B64(CcpCrypto.Seal(key, nonce, aad, plaintext));
+        if (encoded.Length > MaxEncryptedPayloadChars)
+        {
+            Log($"{msgType} is too large for the relay");
+            return false;
+        }
+
+        var args = Auth(new JsonObject
         {
             ["sender_id"] = _deviceId,
             ["recipient_id"] = peerDeviceId,
             ["msg_type"] = msgType,
-            ["encrypted_payload"] = enc["ciphertext"],
-            ["nonce"] = enc["nonce"],
-            ["msg_id"] = Guid.NewGuid().ToString(),
+            ["encrypted_payload"] = encoded,
+            ["nonce"] = CcpCrypto.B64(nonce),
+            ["msg_id"] = msgId,
         });
         if (ttlMs.HasValue) args["ttl_ms"] = ttlMs.Value;
 
-        try
+        // Retrying is safe: Convex de-duplicates by (sender, msg_id).
+        for (var attempt = 0; attempt < 3; attempt++)
         {
-            await MutationAsync("messages:pushMessage", args);
-            Log($"Pushed {msgType} to {Short(peerDeviceId)}");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Log($"Push failed: {ex.Message}");
-            return false;
-        }
-    }
-
-    public async Task<string?> GetPeerPublicKeyAsync(string peerDeviceId)
-    {
-        try
-        {
-            var data = await QueryAsync("devices:getPublicKey", AuthArgs(new JsonObject
+            try
             {
-                ["requester_device_id"] = _deviceId,
-                ["device_id"] = peerDeviceId,
-            }));
-            return data?["public_key_b64"]?.GetValue<string>();
-        }
-        catch { return null; }
-    }
-
-    public async Task<bool> GetPeerOnlineAsync(string peerDeviceId)
-    {
-        try
-        {
-            var data = await QueryAsync("presence:getPresence", AuthArgs(new JsonObject
+                await CallAsync("mutation", "messages:pushMessage", args);
+                MarkActive();
+                return true;
+            }
+            catch (ConvexException ex)
             {
-                ["requester_device_id"] = _deviceId,
-                ["device_id"] = peerDeviceId,
-            }));
-            return data?["online"]?.GetValue<bool>() ?? false;
+                Log($"Relay rejected {msgType}: {ex.Message}");
+                return false;
+            }
+            catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException)
+            {
+                if (attempt == 2)
+                {
+                    Log($"Push {msgType} failed: {ex.Message}");
+                    return false;
+                }
+                await Task.Delay(1000 * (attempt + 1));
+            }
         }
-        catch { return false; }
+        return false;
     }
 
     public async Task<JsonObject?> SendCloudRequestAsync(
         string peerDeviceId,
         string msgType,
         JsonObject? extraPayload = null,
-        int timeoutMs = 15_000)
+        int timeoutMs = 20_000)
     {
         var requestId = Guid.NewGuid().ToString();
         var payload = extraPayload ?? new JsonObject();
         payload["request_id"] = requestId;
 
         var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingRequests[requestId] = tcs;
-
+        _pendingRequests[requestId] = new PendingRequest(peerDeviceId, tcs);
+        MarkActive();
         try
         {
-            if (!await PushMessageAsync(peerDeviceId, msgType, payload))
-            {
-                _pendingRequests.TryRemove(requestId, out _);
-                return null;
-            }
-
-            using var cts = new CancellationTokenSource(timeoutMs);
-            using var registration = cts.Token.Register(() => tcs.TrySetCanceled());
-            return await tcs.Task;
-        }
-        catch (OperationCanceledException)
-        {
+            if (!await PushMessageAsync(peerDeviceId, msgType, payload)) return null;
+            var finished = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
+            if (finished == tcs.Task && tcs.Task.IsCompletedSuccessfully) return tcs.Task.Result;
             Log($"Cloud request {msgType} to {Short(peerDeviceId)} timed out");
             return null;
         }
@@ -293,55 +236,90 @@ public sealed class ConvexService : IDisposable
         }
     }
 
-    public async Task<List<(string DeviceId, string KeyFingerprint, string PairedVia, bool Online)>> ListPairedPeersAsync()
-    {
-        var result = new List<(string, string, string, bool)>();
-        try
-        {
-            var sessionsArray = await QueryArrayAsync("sessions:listSessions", AuthArgs(new JsonObject
-            {
-                ["device_id"] = _deviceId,
-            }));
-            if (sessionsArray is null) return result;
+    // ── Peer metadata ──────────────────────────────────────────────────────
 
-            foreach (var item in sessionsArray)
-            {
-                if (item is not JsonObject session) continue;
-                var peerId = session["peer_id"]?.GetValue<string>() ?? "";
-                if (string.IsNullOrWhiteSpace(peerId)) continue;
-                var online = await GetPeerOnlineAsync(peerId);
-                result.Add((
-                    peerId,
-                    session["key_fingerprint"]?.GetValue<string>() ?? "",
-                    session["paired_via"]?.GetValue<string>() ?? "unknown",
-                    online
-                ));
-            }
-        }
-        catch (Exception ex)
-        {
-            Log($"ListPairedPeers failed: {ex.Message}");
-        }
-        return result;
+    public async Task<IReadOnlyList<string>?> ListPairedPeerIdsAsync()
+    {
+        var sessions = await SafeQueryAsync("sessions:listSessions", Auth(new JsonObject { ["device_id"] = _deviceId })) as JsonArray;
+        if (sessions is null) return null;
+        return sessions.OfType<JsonObject>()
+            .Select(s => CcpWire.Str(s["peer_id"]))
+            .Where(CcpIdentity.IsValidDeviceId)
+            .Distinct()
+            .ToList();
     }
 
-    public async Task<(string Name, string Platform, string AppVersion)?> GetPeerDeviceInfoAsync(string peerDeviceId)
+    public async Task<bool> GetPeerOnlineAsync(string peerDeviceId)
     {
-        try
+        var data = await SafeQueryAsync("presence:getPresence", Auth(new JsonObject
         {
-            var data = await QueryAsync("devices:getDevice", AuthArgs(new JsonObject
+            ["requester_device_id"] = _deviceId,
+            ["device_id"] = peerDeviceId,
+        })) as JsonObject;
+        return CcpWire.Bool(data?["online"]);
+    }
+
+    public async Task<(string Name, string Platform)?> GetPeerDeviceInfoAsync(string peerDeviceId)
+    {
+        if (await SafeQueryAsync("devices:getDevice", Auth(new JsonObject
             {
                 ["requester_device_id"] = _deviceId,
                 ["device_id"] = peerDeviceId,
-            }));
-            if (data is null) return null;
-            return (
-                data["device_name"]?.GetValue<string>() ?? "Unknown",
-                data["platform"]?.GetValue<string>() ?? "unknown",
-                data["app_version"]?.GetValue<string>() ?? "0.0.0"
-            );
+            })) is not JsonObject data)
+        {
+            return null;
         }
-        catch { return null; }
+        return (CcpWire.Str(data["device_name"], "Unknown"), CcpWire.Str(data["platform"], "unknown"));
+    }
+
+    private async Task<JsonNode?> SafeQueryAsync(string path, JsonObject args)
+    {
+        try
+        {
+            return await CallAsync("query", path, args);
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException)
+        {
+            Log($"{path} failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    // ── Background loops ────────────────────────────────────────────────────
+
+    private async Task RegisterLoopAsync(string appVersion, CancellationToken ct)
+    {
+        var backoff = TimeSpan.FromSeconds(5);
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await CallAsync("mutation", "devices:registerDevice", new JsonObject
+                {
+                    ["device_id"] = _deviceId,
+                    ["device_name"] = _deviceName.Length > 64 ? _deviceName[..64] : _deviceName,
+                    ["platform"] = "windows",
+                    ["public_key_b64"] = "",
+                    ["capabilities"] = new JsonArray("pairing", "file.transfer", "device.snapshot", "gallery.list", "files.list"),
+                    ["app_version"] = appVersion,
+                    ["auth_token"] = _cloudAuthToken,
+                }, ct);
+                SetStatus("Cloud connected");
+                Log("Registered on Convex");
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException)
+            {
+                SetStatus("Cloud offline");
+                Log($"Registration failed: {ex.Message}");
+            }
+            await DelayAsync(backoff, ct);
+            backoff = TimeSpan.FromSeconds(Math.Min(backoff.TotalSeconds * 2, 300));
+        }
     }
 
     private async Task HeartbeatLoopAsync(CancellationToken ct)
@@ -350,180 +328,173 @@ public sealed class ConvexService : IDisposable
         {
             try
             {
-                await MutationAsync("presence:heartbeat", AuthArgs(new JsonObject
+                await CallAsync("mutation", "presence:heartbeat", Auth(new JsonObject
                 {
                     ["device_id"] = _deviceId,
                     ["ip_hint"] = GetLocalIpHint(),
-                    ["tcp_port"] = TcpPort,
+                    ["tcp_port"] = CcpWire.TcpPort,
                 }), ct);
             }
-            catch
+            catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException)
             {
+                // The registration loop reports connectivity; a missed beat just shows us offline.
             }
-            await Task.Delay(HeartbeatIntervalMs, ct).ContinueWith(_ => { });
+            await DelayAsync(HeartbeatInterval, ct);
         }
     }
 
     private async Task PollLoopAsync(CancellationToken ct)
     {
+        var interval = PollActive;
         while (!ct.IsCancellationRequested)
         {
+            var count = 0;
             try
             {
-                await PollAndDispatchAsync(ct);
+                count = await PollOnceAsync(ct);
             }
-            catch
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
+                return;
             }
-            await Task.Delay(PollIntervalMs, ct).ContinueWith(_ => { });
+            catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException or JsonException)
+            {
+                Log($"Poll failed: {ex.Message}");
+            }
+            if (count >= PollBatch) continue; // drain a backlog immediately
+
+            var active = count > 0 || !_pendingRequests.IsEmpty || DateTime.UtcNow - _lastActivity < ActiveWindow;
+            interval = active ? PollActive : TimeSpan.FromMilliseconds(Math.Min(interval.TotalMilliseconds * 2, PollIdleMax.TotalMilliseconds));
+            try
+            {
+                await _wake.WaitAsync(interval, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
         }
     }
 
-    private async Task PollAndDispatchAsync(CancellationToken ct)
+    /// <summary>Polls one batch, handles each message, then acks the batch.</summary>
+    private async Task<int> PollOnceAsync(CancellationToken ct)
     {
-        var rawArray = await QueryArrayAsync("messages:pollMessages", AuthArgs(new JsonObject
+        if (await CallAsync("query", "messages:pollMessages", Auth(new JsonObject
+            {
+                ["recipient_id"] = _deviceId,
+                ["limit"] = PollBatch,
+            }), ct) is not JsonArray raw || raw.Count == 0)
         {
-            ["recipient_id"] = _deviceId,
-        }), ct);
-        if (rawArray is null || rawArray.Count == 0) return;
+            return 0;
+        }
 
         var toAck = new JsonArray();
-
-        foreach (var item in rawArray)
+        foreach (var msg in raw.OfType<JsonObject>())
         {
-            if (item is not JsonObject msg) continue;
-            var senderId = msg["sender_id"]?.GetValue<string>() ?? "";
-            var msgType = msg["msg_type"]?.GetValue<string>() ?? "";
-            var nonce = msg["nonce"]?.GetValue<string>() ?? "";
-            var ciphertext = msg["encrypted_payload"]?.GetValue<string>() ?? "";
-            var messageId = msg["message_id"]?.ToString() ?? "";
-
-            var key = await GetSessionKeyAsync(senderId);
-            if (key is null)
-            {
-                Log($"No key for {Short(senderId)}; skipping cloud message");
-                continue;
-            }
-
             try
             {
-                var plaintext = DecryptGcm(key, nonce, ciphertext);
-                var payload = JsonNode.Parse(Encoding.UTF8.GetString(plaintext))?.AsObject() ?? new JsonObject();
-                var requestId = payload["request_id"]?.GetValue<string>();
-                if (requestId is not null && _pendingRequests.TryRemove(requestId, out var tcs))
-                {
-                    Log($"Cloud response {msgType} from {Short(senderId)}");
-                    tcs.TrySetResult(payload);
-                }
-                else
-                {
-                    Log($"Received {msgType} from {Short(senderId)}");
-                    OnMessageReceived?.Invoke(senderId, msgType, payload);
-                }
-
-                toAck.Add(messageId);
+                Dispatch(msg);
             }
             catch (Exception ex)
             {
-                Log($"Decrypt failed: {ex.Message}");
+                // Undecryptable, replayed or failing messages are dropped, not redelivered forever.
+                Log($"Dropped {CcpWire.Str(msg["msg_type"])} from {Short(CcpWire.Str(msg["sender_id"]))}: {ex.Message}");
             }
+            var messageId = CcpWire.Str(msg["message_id"]);
+            if (messageId.Length > 0) toAck.Add(messageId);
         }
 
         if (toAck.Count > 0)
         {
-            await MutationAsync("messages:ackMessages", AuthArgs(new JsonObject
+            await CallAsync("mutation", "messages:ackMessages", Auth(new JsonObject
             {
                 ["recipient_id"] = _deviceId,
                 ["message_ids"] = toAck,
             }), ct);
+            _replayGuard.Persist();
+        }
+        return raw.Count;
+    }
+
+    private void Dispatch(JsonObject msg)
+    {
+        var senderId = CcpWire.Str(msg["sender_id"]);
+        var msgType = CcpWire.Str(msg["msg_type"]);
+        var msgId = CcpWire.Str(msg["msg_id"]);
+        var key = KeyFor(senderId) ?? throw new InvalidOperationException("sender is not paired");
+        var aad = CcpCloudKeys.MessageAad(senderId, _deviceId, msgType, msgId);
+        var plain = CcpCrypto.Open(key, CcpCrypto.UnB64(CcpWire.Str(msg["nonce"])), aad, CcpCrypto.UnB64(CcpWire.Str(msg["encrypted_payload"])));
+        var envelope = CcpWire.ParseObject(Encoding.UTF8.GetString(plain));
+
+        var sentAt = DateTimeOffset.FromUnixTimeMilliseconds(CcpWire.Long(envelope["sent_at"], 0));
+        if ((DateTimeOffset.UtcNow - sentAt).Duration() > MaxMessageAge) throw new InvalidOperationException("message too old");
+        if (!_replayGuard.FirstSeen($"{senderId}|{msgId}")) throw new InvalidOperationException("replayed message");
+
+        var payload = envelope["body"] as JsonObject ?? new JsonObject();
+        MarkActive();
+
+        var requestId = CcpWire.Str(payload["request_id"]);
+        if (requestId.Length > 0 && msgType.EndsWith(".response", StringComparison.Ordinal) &&
+            _pendingRequests.TryGetValue(requestId, out var pending) && pending.PeerId == senderId)
+        {
+            _pendingRequests.TryRemove(requestId, out _);
+            pending.Completion.TrySetResult(payload);
+            return;
+        }
+        OnMessageReceived?.Invoke(senderId, msgType, payload);
+    }
+
+    private void MarkActive()
+    {
+        _lastActivity = DateTime.UtcNow;
+        if (_wake.CurrentCount == 0)
+        {
+            try { _wake.Release(); } catch (SemaphoreFullException) { }
         }
     }
 
-    private static Dictionary<string, string> EncryptGcm(byte[] key, byte[] plaintext)
-    {
-        var nonce = RandomNumberGenerator.GetBytes(12);
-        var ciphertext = new byte[plaintext.Length];
-        var tag = new byte[16];
-        using var aes = new AesGcm(key, 16);
-        aes.Encrypt(nonce, plaintext, ciphertext, tag);
-        var combined = new byte[ciphertext.Length + tag.Length];
-        ciphertext.CopyTo(combined, 0);
-        tag.CopyTo(combined, ciphertext.Length);
-        return new Dictionary<string, string>
-        {
-            ["nonce"] = Convert.ToBase64String(nonce),
-            ["ciphertext"] = Convert.ToBase64String(combined),
-        };
-    }
+    // ── HTTP ────────────────────────────────────────────────────────────────
 
-    private static byte[] DecryptGcm(byte[] key, string nonceB64, string ciphertextB64)
-    {
-        var nonce = Convert.FromBase64String(nonceB64);
-        var combined = Convert.FromBase64String(ciphertextB64);
-        var tag = combined[^16..];
-        var ciphertext = combined[..^16];
-        var plaintext = new byte[ciphertext.Length];
-        using var aes = new AesGcm(key, 16);
-        aes.Decrypt(nonce, ciphertext, tag, plaintext);
-        return plaintext;
-    }
-
-    private JsonObject AuthArgs(JsonObject args)
+    private JsonObject Auth(JsonObject args)
     {
         args["auth_token"] = _cloudAuthToken;
         return args;
     }
 
-    private async Task<JsonObject?> MutationAsync(string func, JsonObject args, CancellationToken ct = default)
+    /// <summary>
+    /// Calls a Convex function over the HTTP API. Convex reports function
+    /// errors as HTTP 200 with status "error"; both become <see cref="ConvexException"/>.
+    /// </summary>
+    private async Task<JsonNode?> CallAsync(string kind, string path, JsonObject args, CancellationToken ct = default)
     {
-        return await PostConvexAsync("mutation", func, args, ct);
-    }
-
-    private async Task<JsonObject?> QueryAsync(string func, JsonObject args, CancellationToken ct = default)
-    {
-        return await PostConvexAsync("query", func, args, ct);
-    }
-
-    private async Task<JsonArray?> QueryArrayAsync(string func, JsonObject args, CancellationToken ct = default)
-    {
-        var body = new JsonObject { ["path"] = func, ["args"] = args, ["format"] = "json" };
-        var content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-        var response = await _http.PostAsync($"{ConvexUrl}/api/query", content, ct);
+        var body = new JsonObject { ["path"] = path, ["args"] = args, ["format"] = "json" };
+        using var content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+        using var response = await _http.PostAsync($"{_convexUrl}/api/{kind}", content, ct);
         var text = await response.Content.ReadAsStringAsync(ct);
-        if (!response.IsSuccessStatusCode)
+        JsonObject? json = null;
+        try { json = JsonNode.Parse(text) as JsonObject; } catch (JsonException) { }
+        if (!response.IsSuccessStatusCode || CcpWire.Str(json?["status"]) == "error")
         {
-            Log($"HTTP {(int)response.StatusCode}: {text}");
-            return null;
+            throw new ConvexException(SummarizeError(CcpWire.Str(json?["errorMessage"]), (int)response.StatusCode));
         }
-        return JsonNode.Parse(text)?["value"]?.AsArray();
+        return json?["value"];
     }
 
-    private async Task<JsonObject?> PostConvexAsync(string endpoint, string func, JsonObject args, CancellationToken ct)
+    /// <summary>Extracts "auth_failed" from Convex's "...Uncaught Error: auth_failed\n at ..." messages.</summary>
+    public static string SummarizeError(string? message, int httpCode)
     {
-        var body = new JsonObject { ["path"] = func, ["args"] = args, ["format"] = "json" };
-        var content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-        try
-        {
-            var response = await _http.PostAsync($"{ConvexUrl}/api/{endpoint}", content, ct);
-            var text = await response.Content.ReadAsStringAsync(ct);
-            if (!response.IsSuccessStatusCode)
-            {
-                Log($"HTTP {(int)response.StatusCode}: {text[..Math.Min(200, text.Length)]}");
-                return null;
-            }
-            return JsonNode.Parse(text)?["value"]?.AsObject();
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            Log($"Request failed ({func}): {ex.Message}");
-            return null;
-        }
+        if (string.IsNullOrWhiteSpace(message)) return $"HTTP {httpCode}";
+        var match = UncaughtError().Match(message);
+        var summary = match.Success ? match.Groups[1].Value.Trim() : message.Split('\n')[0];
+        return summary.Length > 200 ? summary[..200] : summary;
     }
+
+    [GeneratedRegex(@"Uncaught Error: ([^\n]+)")]
+    private static partial Regex UncaughtError();
 
     private static string GetLocalIpHint()
     {
-        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.OperationalStatus == OperationalStatus.Up))
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up))
         {
             foreach (var addr in nic.GetIPProperties().UnicastAddresses)
             {
@@ -538,8 +509,12 @@ public sealed class ConvexService : IDisposable
         return "x.x.x.x";
     }
 
-    private static string Short(string value, int length = 8) =>
-        value[..Math.Min(length, value.Length)];
+    private static async Task DelayAsync(TimeSpan delay, CancellationToken ct)
+    {
+        try { await Task.Delay(delay, ct); } catch (OperationCanceledException) { }
+    }
+
+    private static string Short(string value, int length = 8) => value[..Math.Min(length, value.Length)];
 
     private void SetStatus(string status)
     {
@@ -554,5 +529,75 @@ public sealed class ConvexService : IDisposable
         _cts?.Cancel();
         _cts?.Dispose();
         _http.Dispose();
+        _wake.Dispose();
+    }
+
+    /// <summary>Persisted set of recently seen relay message ids (bounded).</summary>
+    private sealed class ReplayGuard
+    {
+        private const int MaxEntries = 2000;
+        private readonly string _path;
+        private readonly LinkedList<string> _order = new();
+        private readonly HashSet<string> _seen = [];
+        private readonly object _lock = new();
+        private bool _dirty;
+
+        public ReplayGuard(string path)
+        {
+            _path = path;
+            try
+            {
+                if (File.Exists(path) && JsonSerializer.Deserialize<List<string>>(File.ReadAllText(path)) is { } ids)
+                {
+                    foreach (var id in ids) Add(id);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or JsonException)
+            {
+                // A lost replay cache only weakens replay protection until refilled.
+            }
+        }
+
+        public bool FirstSeen(string id)
+        {
+            lock (_lock)
+            {
+                if (_seen.Contains(id)) return false;
+                Add(id);
+                _dirty = true;
+                return true;
+            }
+        }
+
+        public void Persist()
+        {
+            lock (_lock)
+            {
+                if (!_dirty) return;
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+                    var temp = _path + ".tmp";
+                    File.WriteAllText(temp, JsonSerializer.Serialize(_order.ToList()));
+                    File.Move(temp, _path, overwrite: true);
+                    _dirty = false;
+                }
+                catch (IOException)
+                {
+                    // Retry on the next batch.
+                }
+            }
+        }
+
+        private void Add(string id)
+        {
+            if (!_seen.Add(id)) return;
+            _order.AddLast(id);
+            while (_order.Count > MaxEntries)
+            {
+                _seen.Remove(_order.First!.Value);
+                _order.RemoveFirst();
+            }
+        }
     }
 }

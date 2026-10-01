@@ -11,6 +11,9 @@
   <ItemGroup>
     <Compile Include="..\native-csharp\Services\CcpCrypto.cs" Link="Linked\CcpCrypto.cs" />
     <Compile Include="..\native-csharp\Services\LineIo.cs" Link="Linked\LineIo.cs" />
+    <Compile Include="..\native-csharp\Services\LanSession.cs" Link="Linked\LanSession.cs" />
+    <Compile Include="..\native-csharp\Services\LanPairing.cs" Link="Linked\LanPairing.cs" />
+    <Compile Include="..\native-csharp\Services\FileTransfer.cs" Link="Linked\FileTransfer.cs" />
   </ItemGroup>
 
   <ItemGroup>

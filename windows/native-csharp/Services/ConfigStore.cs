@@ -6,98 +6,181 @@ using System.Text.Json;
 
 namespace CCP.Windows.Services;
 
+/// <summary>
+/// Persists identity and trust in %APPDATA%\CCP\config-windows-native.json.
+///
+///  • Secrets (cloud auth token, pair secrets) are encrypted with DPAPI for the
+///    current Windows user, so copying the file to another account or machine
+///    doesn't reveal them.
+///  • Writes go to a temp file and are swapped in atomically, so a crash can't
+///    leave a truncated config.
+///  • A config that can't be read is moved aside instead of being silently
+///    replaced by a new identity.
+///  • v1 trust: a peer is trusted only with a pair secret from an approved ECDH
+///    pairing. Pre-v1 secrets were sent in clear and are discarded.
+/// </summary>
 public sealed class ConfigStore
 {
+    private const string ProtectedPrefix = "dpapi:";
+    private static readonly byte[] Entropy = "ccp-config-v1"u8.ToArray();
+
+    private readonly object _lock = new();
     private readonly string _path;
     private ConfigDocument _config;
 
-    public ConfigStore()
+    public ConfigStore(string? directory = null)
     {
-        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CCP");
+        var root = directory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CCP");
         Directory.CreateDirectory(root);
         _path = Path.Combine(root, "config-windows-native.json");
         _config = TryLoad() ?? ConfigDocument.Create();
 
-        if (string.IsNullOrWhiteSpace(_config.PrivateKeyB64))
+        var token = Unprotect(_config.CloudAuthTokenB64);
+        if (string.IsNullOrWhiteSpace(token))
         {
-            _config = _config with { PrivateKeyB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) };
+            token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
         }
-        if (string.IsNullOrWhiteSpace(_config.CloudAuthTokenB64))
+        CloudAuthToken = token;
+
+        _config = _config with
         {
-            _config = _config with { CloudAuthTokenB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) };
-        }
-        // v1 identity: the device id is bound to the cloud auth token so the
-        // Convex backend can verify ownership of the id.
-        var derivedId = DeriveDeviceId(_config.CloudAuthTokenB64);
-        if (!string.Equals(_config.DeviceId, derivedId, StringComparison.Ordinal))
+            // v1 identity: the device id is bound to the cloud auth token so the
+            // Convex backend can verify ownership of the id.
+            DeviceId = CcpIdentity.DeriveDeviceId(token),
+            CloudAuthTokenB64 = Protect(token),
+            PrivateKeyB64 = "",
+            PairSecrets = [],
+        };
+        // Peers without a v1 secret are no longer trusted.
+        foreach (var id in _config.TrustedPeers.Keys.Where(id => !_config.PairSecretsV1.ContainsKey(id)).ToList())
         {
-            _config = _config with { DeviceId = derivedId };
+            _config.TrustedPeers.Remove(id);
         }
         Save();
-    }
-
-    private ConfigDocument? TryLoad()
-    {
-        try
-        {
-            if (!File.Exists(_path)) return null;
-            return JsonSerializer.Deserialize<ConfigDocument>(File.ReadAllText(_path));
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     public string DeviceId => _config.DeviceId;
     public string DeviceName => _config.DeviceName;
+    public string CloudAuthToken { get; }
     public SenderInfo Sender => new(DeviceId, DeviceName, "windows");
 
-    public byte[] PrivateKey => Convert.FromBase64String(_config.PrivateKeyB64);
-    public string CloudAuthToken => _config.CloudAuthTokenB64;
+    public bool IsTrusted(string deviceId) => PairSecret(deviceId) is not null;
 
-    public bool IsTrusted(string deviceId) => _config.TrustedPeers.ContainsKey(deviceId);
-    public string? PairSecret(string deviceId) =>
-        _config.PairSecrets.TryGetValue(deviceId, out var secret) ? secret : null;
-
-    public void Trust(SenderInfo sender, string? pairSecretB64 = null)
+    /// <summary>The 32-byte v1 pair secret, or null when the peer isn't paired.</summary>
+    public byte[]? PairSecret(string deviceId)
     {
-        _config.TrustedPeers[sender.DeviceId] = sender;
-        if (!string.IsNullOrWhiteSpace(pairSecretB64))
+        lock (_lock)
         {
-            _config.PairSecrets[sender.DeviceId] = pairSecretB64;
+            if (!_config.PairSecretsV1.TryGetValue(deviceId, out var stored)) return null;
+            try
+            {
+                var secret = Convert.FromBase64String(Unprotect(stored));
+                return secret.Length == 32 ? secret : null;
+            }
+            catch (Exception ex) when (ex is FormatException or CryptographicException)
+            {
+                return null;
+            }
         }
-        Save();
     }
 
-    /// <summary>device_id = sha256_hex("ccp-device-id-v1:" + sha256_hex(token)).</summary>
-    public static string DeriveDeviceId(string cloudAuthToken) => CcpIdentity.DeriveDeviceId(cloudAuthToken);
+    public SenderInfo? PeerInfo(string deviceId)
+    {
+        lock (_lock) return _config.TrustedPeers.GetValueOrDefault(deviceId);
+    }
+
+    public IReadOnlyList<string> TrustedPeerIds()
+    {
+        lock (_lock) return _config.PairSecretsV1.Keys.ToList();
+    }
+
+    public void Trust(SenderInfo peer, byte[] pairSecret)
+    {
+        if (pairSecret.Length != 32) throw new ArgumentException("pair secret must be 32 bytes", nameof(pairSecret));
+        if (!CcpIdentity.IsValidDeviceId(peer.DeviceId)) throw new ArgumentException("invalid device id", nameof(peer));
+        var clean = new SenderInfo(
+            peer.DeviceId,
+            Truncate(peer.DeviceName, 64),
+            Truncate(peer.Platform, 16));
+        lock (_lock)
+        {
+            _config.TrustedPeers[peer.DeviceId] = clean;
+            _config.PairSecretsV1[peer.DeviceId] = Protect(Convert.ToBase64String(pairSecret));
+            Save();
+        }
+    }
+
+    public void Forget(string deviceId)
+    {
+        lock (_lock)
+        {
+            _config.TrustedPeers.Remove(deviceId);
+            _config.PairSecretsV1.Remove(deviceId);
+            Save();
+        }
+    }
+
+    private static string Truncate(string? value, int max) =>
+        string.IsNullOrEmpty(value) ? "Unknown" : value.Length <= max ? value : value[..max];
+
+    private ConfigDocument? TryLoad()
+    {
+        if (!File.Exists(_path)) return null;
+        try
+        {
+            return JsonSerializer.Deserialize<ConfigDocument>(File.ReadAllText(_path))
+                ?? throw new JsonException("empty config");
+        }
+        catch (Exception ex) when (ex is JsonException or IOException or NotSupportedException)
+        {
+            // Keep the unreadable file for recovery rather than overwriting it.
+            var backup = $"{_path}.corrupt-{DateTime.Now:yyyyMMddHHmmss}";
+            try { File.Move(_path, backup); } catch (IOException) { }
+            return null;
+        }
+    }
 
     private void Save()
     {
-        File.WriteAllText(_path, JsonSerializer.Serialize(_config, new JsonSerializerOptions { WriteIndented = true }));
+        lock (_lock)
+        {
+            var temp = _path + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(_config, new JsonSerializerOptions { WriteIndented = true }));
+            File.Move(temp, _path, overwrite: true);
+        }
+    }
+
+    private static string Protect(string plaintext)
+    {
+        var data = ProtectedData.Protect(Encoding.UTF8.GetBytes(plaintext), Entropy, DataProtectionScope.CurrentUser);
+        return ProtectedPrefix + Convert.ToBase64String(data);
+    }
+
+    /// <summary>Decrypts a DPAPI value; values from older builds (plain text) are returned as-is.</summary>
+    private static string Unprotect(string stored)
+    {
+        if (string.IsNullOrEmpty(stored)) return "";
+        if (!stored.StartsWith(ProtectedPrefix, StringComparison.Ordinal)) return stored;
+        var data = Convert.FromBase64String(stored[ProtectedPrefix.Length..]);
+        return Encoding.UTF8.GetString(ProtectedData.Unprotect(data, Entropy, DataProtectionScope.CurrentUser));
     }
 
     private sealed record ConfigDocument
     {
         public required string DeviceId { get; init; }
         public required string DeviceName { get; init; }
+        /// <summary>Unused since v1; kept so older files still deserialize.</summary>
         public string PrivateKeyB64 { get; init; } = "";
         public string CloudAuthTokenB64 { get; init; } = "";
         public Dictionary<string, SenderInfo> TrustedPeers { get; init; } = [];
+        /// <summary>Pre-v1 secrets (sent in clear); always emptied on load.</summary>
         public Dictionary<string, string> PairSecrets { get; init; } = [];
+        public Dictionary<string, string> PairSecretsV1 { get; init; } = [];
 
-        public static ConfigDocument Create()
+        public static ConfigDocument Create() => new()
         {
-            var seed = $"{Environment.MachineName}-{Guid.NewGuid()}";
-            var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(seed))).ToLowerInvariant();
-            return new ConfigDocument
-            {
-                DeviceId = hash,
-                DeviceName = $"{Environment.MachineName} Windows",
-                PrivateKeyB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)),
-                CloudAuthTokenB64 = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)),
-            };
-        }
+            DeviceId = "",
+            DeviceName = $"{Environment.MachineName} Windows",
+        };
     }
 }

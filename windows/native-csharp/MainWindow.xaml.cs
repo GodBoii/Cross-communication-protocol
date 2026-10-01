@@ -14,6 +14,7 @@ namespace CCP.Windows;
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
     private readonly CcpNode _node;
+    private PairCodeWindow? _pairCodeWindow;
     private PeerView? _selectedPeer;
     private CancellationTokenSource? _panelLoopCts;
     private bool _isLoadingPanel;
@@ -216,7 +217,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 OnPropertyChanged(nameof(FooterStatus));
             }),
             confirm: (title, message) => Dispatcher.Invoke(() =>
-                MessageBox.Show(this, message, title, MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes));
+                MessageBox.Show(this, message, title, MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) == MessageBoxResult.Yes),
+            onOutgoingPairCode: (peerName, code) => Dispatcher.Invoke(() =>
+            {
+                _pairCodeWindow?.Close();
+                _pairCodeWindow = null;
+                if (code is null) return;
+                _pairCodeWindow = new PairCodeWindow(this, peerName, code);
+                _pairCodeWindow.CancelRequested += CancelOutgoingPair;
+                _pairCodeWindow.Show();
+            }));
 
         PairCommand = new RelayCommand<PeerView>(peer => _ = PairPeerAsync(peer), peer => peer is not null);
         InspectCommand = new RelayCommand<PeerView>(peer => SelectedPeer = peer, peer => peer?.Trusted == true);
@@ -254,6 +264,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             while (Events.Count > 100) Events.RemoveAt(Events.Count - 1);
         });
     }
+
+    private void CancelOutgoingPair() => _node.CancelOutgoingPair();
 
     private static CloudConnectionState ParseCloudState(string status)
     {
