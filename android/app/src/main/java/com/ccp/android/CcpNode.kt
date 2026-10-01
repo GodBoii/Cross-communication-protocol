@@ -12,23 +12,24 @@ import android.provider.Settings
 import android.provider.OpenableColumns
 import android.telecom.TelecomManager
 import android.util.Base64
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -48,7 +49,17 @@ data class PendingPairRequest(
 )
 
 class CcpNode(private val context: Context) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Any exception escaping a coroutine would otherwise reach the default
+    // uncaught-exception handler and kill the process; a malformed packet from
+    // the LAN must never be able to do that.
+    private val crashGuard = CoroutineExceptionHandler { _, error ->
+        log("Internal error: ${error.javaClass.simpleName}: ${error.message}")
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + crashGuard)
+    private var nodeJob: Job? = null
+    private val connectionSlots = Semaphore(MAX_CONCURRENT_CONNECTIONS)
+    @Volatile private var tcpServer: ServerSocket? = null
+    @Volatile private var udpSocket: DatagramSocket? = null
     private val store = PeerStore(context)
     private val deviceData = DeviceDataRepository(context)
     private val peersById = linkedMapOf<String, DeviceInfo>()
@@ -104,6 +115,7 @@ class CcpNode(private val context: Context) {
         _pendingPairRequest.value = null
     }
 
+    @Synchronized
     fun start() {
         if (running) return
         running = true
@@ -112,12 +124,14 @@ class CcpNode(private val context: Context) {
             setReferenceCounted(false)
             acquire()
         }
-        scope.launch { broadcastDiscovery() }
-        scope.launch { listenDiscovery() }
-        scope.launch { listenTcp() }
+        val job = SupervisorJob(scope.coroutineContext[Job])
+        nodeJob = job
+        scope.launch(job) { broadcastDiscovery() }
+        scope.launch(job) { resilient("UDP discovery listener") { listenDiscovery() } }
+        scope.launch(job) { resilient("TCP listener") { listenTcp() } }
         refreshLocalData()
         // Start Convex cloud bridge
-        scope.launch {
+        scope.launch(job) {
             convexBridge.start(
                 appVersion = "0.2.0",
                 capabilities = listOf(
@@ -127,20 +141,61 @@ class CcpNode(private val context: Context) {
                 )
             )
         }
-        scope.launch { cloudPeerLoop() }
+        scope.launch(job) { cloudPeerLoop() }
         log("Native Android node started on UDP $CCP_UDP_PORT and TCP $CCP_TCP_PORT")
     }
 
+    @Synchronized
     fun stop() {
+        if (!running) return
         running = false
         convexBridge.stop()
-        multicastLock?.release()
+        // Closing the sockets unblocks accept()/receive() immediately so a
+        // quick restart doesn't race the old listeners for the ports.
+        runCatching { tcpServer?.close() }
+        runCatching { udpSocket?.close() }
+        tcpServer = null
+        udpSocket = null
+        nodeJob?.cancel()
+        nodeJob = null
+        runCatching { multicastLock?.release() }
         multicastLock = null
         log("Native Android node stopped")
     }
 
-    fun pair(peer: DeviceInfo) {
+    /**
+     * Runs a long-lived listener, restarting it with backoff if it fails
+     * (e.g. the port is briefly still bound after a restart).
+     */
+    private suspend fun resilient(name: String, block: suspend () -> Unit) {
+        var backoffMs = 1_000L
+        while (running && kotlin.coroutines.coroutineContext.isActive) {
+            try {
+                block()
+                backoffMs = 1_000L
+            } catch (e: Exception) {
+                if (!running) return
+                log("$name failed: ${e.message}; retrying in ${backoffMs / 1000}s")
+                delay(backoffMs)
+                backoffMs = (backoffMs * 2).coerceAtMost(30_000L)
+            }
+        }
+    }
+
+    /** Launches user-initiated work, reporting failures in the event log. */
+    private fun launchTask(label: String, block: suspend CoroutineScope.() -> Unit): Job =
         scope.launch {
+            try {
+                block()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log("$label failed: ${e.message}")
+            }
+        }
+
+    fun pair(peer: DeviceInfo) {
+        launchTask("Pairing with ${peer.deviceName}") {
             val code = Random.nextInt(0, 999999).toString().padStart(6, '0')
             val pairSecret = generatePairSecret()
             log("Pair request sent to ${peer.deviceName}. Code $code")
@@ -185,15 +240,15 @@ class CcpNode(private val context: Context) {
     }
 
     fun sendFile(peer: DeviceInfo, uri: Uri) {
-        scope.launch {
+        launchTask("Sending file to ${peer.deviceName}") {
             if (!peer.trusted) {
                 log("Pair with ${peer.deviceName} before sending files.")
-                return@launch
+                return@launchTask
             }
 
             if (peer.isCloudPeer) {
                 sendFileViaCloud(peer, uri)
-                return@launch
+                return@launchTask
             }
 
             val fileName = resolveDisplayName(uri)
@@ -205,8 +260,8 @@ class CcpNode(private val context: Context) {
             val transferId = java.util.UUID.randomUUID().toString()
 
             connectPeer(peer).use { socket ->
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
+                val reader = BoundedLineReader(socket.getInputStream())
+                val writer = LineWriter(socket.getOutputStream())
                 write(writer, ccpEnvelope("file.offer", store.sender(), JSONObject()
                     .put("transfer_id", transferId)
                     .put("filename", fileName)
@@ -215,7 +270,7 @@ class CcpNode(private val context: Context) {
                     .put("chunk_size", CCP_CHUNK_SIZE)
                     .put("total_chunks", totalChunks)))
 
-                val offerResponse = JSONObject(reader.readLine())
+                val offerResponse = JSONObject(reader.readLine() ?: error("Connection closed before offer response"))
                 if (!offerResponse.getJSONObject("payload").optBoolean("accepted")) {
                     log("${peer.deviceName} rejected $fileName")
                     return@use
@@ -244,21 +299,21 @@ class CcpNode(private val context: Context) {
                 write(writer, ccpEnvelope("file.complete", store.sender(), JSONObject()
                     .put("transfer_id", transferId)
                     .put("sha256", fullHash)))
-                val complete = JSONObject(reader.readLine())
+                val complete = JSONObject(reader.readLine() ?: error("Connection closed before completion"))
                 log(if (complete.getJSONObject("payload").optBoolean("ok")) "Sent and verified $fileName" else "Receiver verification failed for $fileName")
             }
         }
     }
 
     fun inspectPeer(peer: DeviceInfo) {
-        scope.launch {
+        launchTask("Loading panel for ${peer.deviceName}") {
             if (!peer.trusted) {
                 log("Pair with ${peer.deviceName} before loading its panel.")
-                return@launch
+                return@launchTask
             }
             if (peer.isCloudPeer) {
                 inspectPeerViaCloud(peer)
-                return@launch
+                return@launchTask
             }
             val snapshot = sendSingle(peer, ccpEnvelope("device.snapshot.request", store.sender(), JSONObject()))
             val gallery = sendSingle(peer, ccpEnvelope("gallery.list.request", store.sender(), JSONObject()))
@@ -388,15 +443,20 @@ class CcpNode(private val context: Context) {
     }
 
     private fun listenDiscovery() {
-        DatagramSocket(CCP_UDP_PORT).use { socket ->
+        DatagramSocket(null).apply {
+            reuseAddress = true
+            bind(java.net.InetSocketAddress(CCP_UDP_PORT))
+        }.use { socket ->
+            udpSocket = socket
             socket.soTimeout = 2000
             val buffer = ByteArray(8192)
             while (running) {
                 try {
                     val packet = DatagramPacket(buffer, buffer.size)
                     socket.receive(packet)
-                    val json = JSONObject(String(packet.data, 0, packet.length))
+                    val json = JSONObject(String(packet.data, 0, packet.length, Charsets.UTF_8))
                     if (json.optString("protocol") != CCP_PROTOCOL || json.optString("device_id") == store.deviceId) continue
+                    if (!isValidDeviceId(json.optString("device_id"))) continue
                     updatePeer(
                         DeviceInfo(
                             deviceId = json.getString("device_id"),
@@ -410,22 +470,46 @@ class CcpNode(private val context: Context) {
                         )
                     )
                 } catch (_: SocketTimeoutException) {
+                } catch (e: java.net.SocketException) {
+                    if (!running) return
+                    throw e
                 } catch (e: Exception) {
-                    log("Discovery receive failed: ${e.message}")
+                    // Malformed packets are expected on a shared LAN; drop them quietly.
                 }
             }
         }
     }
 
     private fun listenTcp() {
-        ServerSocket(CCP_TCP_PORT).use { server ->
+        ServerSocket().apply {
+            reuseAddress = true
+            bind(java.net.InetSocketAddress(CCP_TCP_PORT))
+        }.use { server ->
+            tcpServer = server
             server.soTimeout = 2000
             log("TCP listener active on $CCP_TCP_PORT")
             while (running) {
-                try {
-                    val socket = server.accept()
-                    scope.launch { handleClient(socket) }
+                val socket = try {
+                    server.accept()
                 } catch (_: SocketTimeoutException) {
+                    continue
+                } catch (e: java.net.SocketException) {
+                    if (!running) return
+                    throw e
+                }
+                if (!connectionSlots.tryAcquire()) {
+                    // Too many concurrent peers: refuse rather than queue unbounded work.
+                    runCatching { socket.close() }
+                    continue
+                }
+                scope.launch(nodeJob ?: scope.coroutineContext) {
+                    try {
+                        handleClient(socket)
+                    } catch (e: Exception) {
+                        log("Connection from ${socket.inetAddress?.hostAddress} closed: ${e.message}")
+                    } finally {
+                        connectionSlots.release()
+                    }
                 }
             }
         }
@@ -434,8 +518,9 @@ class CcpNode(private val context: Context) {
     private suspend fun handleClient(socket: Socket) {
         socket.use {
             it.tcpNoDelay = true
-            val reader = BufferedReader(InputStreamReader(it.getInputStream()))
-            val writer = BufferedWriter(OutputStreamWriter(it.getOutputStream()))
+            it.soTimeout = CCP_SOCKET_IDLE_TIMEOUT_MS
+            val reader = BoundedLineReader(it.getInputStream())
+            val writer = LineWriter(it.getOutputStream())
             var activeFile: File? = null
             var activeOutput: FileOutputStream? = null
             var expectedHash: String? = null
@@ -594,11 +679,16 @@ class CcpNode(private val context: Context) {
     }
 
     private fun sendSingle(peer: DeviceInfo, message: JSONObject): JSONObject? {
-        return connectPeer(peer).use { socket ->
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
-            write(writer, message)
-            JSONObject(reader.readLine())
+        return try {
+            connectPeer(peer).use { socket ->
+                val reader = BoundedLineReader(socket.getInputStream())
+                val writer = LineWriter(socket.getOutputStream())
+                write(writer, message)
+                reader.readLine()?.let { JSONObject(it) }
+            }
+        } catch (e: Exception) {
+            log("Request to ${peer.deviceName} failed: ${e.message}")
+            null
         }
     }
 
@@ -609,6 +699,7 @@ class CcpNode(private val context: Context) {
             try {
                 val socket = Socket()
                 socket.tcpNoDelay = true
+                socket.soTimeout = CCP_SOCKET_IDLE_TIMEOUT_MS
                 socket.connect(java.net.InetSocketAddress(route.host, route.tcpPort), 2500)
                 log("Connected to ${peer.deviceName} via ${route.transport}")
                 return socket
@@ -633,10 +724,8 @@ class CcpNode(private val context: Context) {
                 .thenBy { priority[it.transport] ?: 99 })
     }
 
-    private fun write(writer: BufferedWriter, message: JSONObject) {
-        writer.write(message.toString())
-        writer.newLine()
-        writer.flush()
+    private fun write(writer: LineWriter, message: JSONObject) {
+        writer.writeLine(message.toString())
     }
 
     private fun updatePeer(peer: DeviceInfo) {
@@ -744,7 +833,8 @@ class CcpNode(private val context: Context) {
     }
 
     private fun log(message: String) {
-        _events.value = (_events.value + message).takeLast(80)
+        // update{} is atomic; read-modify-write on .value loses events under concurrency.
+        _events.update { (it + message).takeLast(80) }
     }
 
     /** Handle a message received from the Convex cloud relay. */

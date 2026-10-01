@@ -11,6 +11,16 @@ const val CCP_UDP_PORT = 47827
 const val CCP_TCP_PORT = 47828
 const val CCP_CHUNK_SIZE = 64 * 1024
 
+/** Upper bound on simultaneous inbound TCP sessions. */
+const val MAX_CONCURRENT_CONNECTIONS = 16
+
+/** Read timeout for TCP sessions; longer than the 60 s pairing prompt. */
+const val CCP_SOCKET_IDLE_TIMEOUT_MS = 90_000
+
+private val DEVICE_ID_PATTERN = Regex("^[0-9a-f]{64}$")
+
+fun isValidDeviceId(value: String?): Boolean = value != null && DEVICE_ID_PATTERN.matches(value)
+
 data class ConnectionRoute(
     val transport: String,
     val host: String,
