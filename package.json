@@ -3,11 +3,12 @@
   "private": true,
   "description": "CCP cross-platform connectivity: Convex relay backend and Capacitor shell",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.6"
   },
   "scripts": {
     "typecheck": "tsc -p convex",
-    "check": "npm run typecheck",
+    "test:convex": "node --test --experimental-strip-types --no-warnings tests/convex-auth.test.mts",
+    "check": "npm run typecheck && npm run test:convex",
     "test": "npm run check",
     "convex:codegen": "convex codegen",
     "convex:deploy": "convex deploy",
