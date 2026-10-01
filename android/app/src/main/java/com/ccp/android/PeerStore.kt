@@ -19,6 +19,7 @@ import java.security.SecureRandom
  */
 class PeerStore(context: Context) {
     private val prefs = context.getSharedPreferences("ccp_native", Context.MODE_PRIVATE)
+    private val secretBox = SecretBox()
 
     val cloudAuthToken: String = loadOrCreateCloudToken(context)
 
@@ -47,8 +48,14 @@ class PeerStore(context: Context) {
     /** The 32-byte v1 pair secret, or null if the peer isn't (or is no longer) paired. */
     fun pairSecretBytes(deviceId: String): ByteArray? {
         if (!isValidDeviceId(deviceId)) return null
-        val encoded = prefs.getString(SECRET_PREFIX + deviceId, null) ?: return null
-        return runCatching { Base64.decode(encoded, Base64.NO_WRAP) }.getOrNull()?.takeIf { it.size == 32 }
+        val stored = prefs.getString(SECRET_PREFIX + deviceId, null) ?: return null
+        val encoded = secretBox.open(stored) ?: return null
+        val secret = runCatching { Base64.decode(encoded, Base64.NO_WRAP) }.getOrNull()?.takeIf { it.size == 32 } ?: return null
+        if (!secretBox.isSealed(stored) && secretBox.isHardwareBacked) {
+            // Upgrade values written before Keystore protection existed.
+            prefs.edit().putString(SECRET_PREFIX + deviceId, secretBox.seal(encoded)).apply()
+        }
+        return secret
     }
 
     fun peerInfo(deviceId: String): JSONObject? =
@@ -68,7 +75,7 @@ class PeerStore(context: Context) {
             .put("paired_at", System.currentTimeMillis())
         prefs.edit()
             .putString(PEER_PREFIX + deviceId, info.toString())
-            .putString(SECRET_PREFIX + deviceId, Base64.encodeToString(pairSecret, Base64.NO_WRAP))
+            .putString(SECRET_PREFIX + deviceId, secretBox.seal(Base64.encodeToString(pairSecret, Base64.NO_WRAP)))
             .apply()
     }
 
@@ -83,20 +90,31 @@ class PeerStore(context: Context) {
     }
 
     private fun loadOrCreateCloudToken(context: Context): String {
-        prefs.getString("cloud_auth_token", null)?.let { return it }
+        prefs.getString(TOKEN_KEY, null)?.let { stored ->
+            val token = secretBox.open(stored)
+            if (token != null) {
+                if (!secretBox.isSealed(stored) && secretBox.isHardwareBacked) {
+                    prefs.edit().putString(TOKEN_KEY, secretBox.seal(token)).apply()
+                }
+                return token
+            }
+            // The Keystore key is gone (e.g. data restored onto a new device):
+            // start a fresh identity rather than reuse one we can't prove.
+        }
         // Migrate the token that older builds kept in the Convex bridge prefs.
         val legacy = context.getSharedPreferences("ccp_convex", Context.MODE_PRIVATE)
-            .getString("cloud_auth_token", null)
+            .getString(TOKEN_KEY, null)
         val token = legacy ?: Base64.encodeToString(
             ByteArray(32).also { SecureRandom().nextBytes(it) },
             Base64.NO_WRAP
         )
-        prefs.edit().putString("cloud_auth_token", token).apply()
+        prefs.edit().putString(TOKEN_KEY, secretBox.seal(token)).apply()
         return token
     }
 
     companion object {
         const val DEVICE_ID_PREFIX = "ccp-device-id-v1:"
+        private const val TOKEN_KEY = "cloud_auth_token"
         private const val PEER_PREFIX = "peer."
         private const val SECRET_PREFIX = "peer_secret_v1."
         private const val LEGACY_SECRET_PREFIX = "peer_secret."
